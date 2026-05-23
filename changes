@@ -4,3 +4,5 @@ v0.2
   enhanced notes for config.sample.ini
 v0.3
   add locking mechanism to transfer process
+v0.5
+  changede service name and changed from polling to signal monitoring
