@@ -61,7 +61,7 @@ GEN_AUTO_CURRENT_OFF = 2
 GEN_AUTO_CURRENT_ON = 3
 
 # Configuration file path
-CONFIG_FILE_PATH = '/data/apps/dynamic_transferswitch/config.ini'
+CONFIG_FILE_PATH = './config.ini'
 
 class TransferState(Enum):
     """Transfer state machine states"""
