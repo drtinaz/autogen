@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 """
-Dynamic Transfer Switch with Generator Auto Current Derating
+External Transfer Switch with Generator Auto Current Derating
 
 This script combines two functions:
 1. External transfer switch integration for MultiPlus/Quattro inverters
@@ -22,15 +22,17 @@ import dbus
 import configparser
 import threading
 from enum import Enum
+from functools import partial
 
 from gi.repository import GLib
+from dbus.mainloop.glib import DBusGMainLoop
 
 sys.path.insert(
     1,
     "/opt/victronenergy/dbus-systemcalc-py/ext/velib_python"
 )
 
-from vedbus import VeDbusService
+from vedbus import VeDbusService, VeDbusItemImport
 from ve_utils import wrap_dbus_value
 from settingsdevice import SettingsDevice
 
@@ -45,12 +47,20 @@ SYSTEM_SERVICE = "com.victronenergy.system"
 
 ALTITUDE_PATH = "/Altitude"
 AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH = "/Ac/ActiveIn/CurrentLimit"
+AC_INPUT_1_PATH = "/Settings/SystemSetup/AcInput1"
+AC_INPUT_2_PATH = "/Settings/SystemSetup/AcInput2"
+NUMBER_OF_AC_INPUTS_PATH = "/Ac/NumberOfAcInputs"
+CURRENT_LIMIT_PATH = "/Ac/ActiveIn/CurrentLimit"
+CURRENT_LIMIT_IS_ADJUSTABLE_PATH = "/Ac/ActiveIn/CurrentLimitIsAdjustable"
+IGNORE_AC_IN_1_PATH = "/Ac/Control/IgnoreAcIn1"
+REMOTE_GENERATOR_SELECTED_PATH = "/Ac/Control/RemoteGeneratorSelected"
 TEMPERATURE_PATH = "/Temperature"
 CUSTOM_NAME_PATH = "/CustomName"
 STATE_PATH = "/State"
 PRODUCT_NAME_PATH = "/ProductName"
 BUS_ITEM_INTERFACE = "com.victronenergy.BusItem"
 GENERATOR_CURRENT_LIMIT_PATH = "/Settings/TransferSwitch/GeneratorCurrentLimit"
+GRID_CURRENT_LIMIT_PATH = "/Settings/TransferSwitch/GridCurrentLimit"
 
 # Transfer switch state values
 GENERATOR_ON_VALUE = (12, 3)
@@ -61,7 +71,8 @@ GEN_AUTO_CURRENT_OFF = 2
 GEN_AUTO_CURRENT_ON = 3
 
 # Configuration file path
-CONFIG_FILE_PATH = './config.ini'
+script_dir = os.path.dirname(os.path.abspath(__file__))
+CONFIG_FILE_PATH = os.path.join(script_dir, 'config.ini')
 
 class TransferState(Enum):
     """Transfer state machine states"""
@@ -118,6 +129,8 @@ class AtomicTransferLock:
 
 class DynamicTransferSwitch:
     def __init__(self):
+        # Setup DBus main loop
+        DBusGMainLoop(set_as_default=True)
         self.bus = dbus.SystemBus()
         
         # Load configuration
@@ -132,26 +145,35 @@ class DynamicTransferSwitch:
         # Startup synchronization
         self.startup_sync_complete = False
         self.startup_sequence_run = False
-        self.startup_settle_done = False
+        self._initial_derating_done = False
         
-        # D-Bus objects
+        # VE.Bus direct objects
         self.vebus_service = None
-        self.acInputTypeObj = None
-        self.numberOfAcInputs = 0
-        self.currentLimitObj = None
-        self.currentLimitIsAdjustableObj = None
-        self.ignoreAcIn1Obj = None
-        self.remoteGeneratorSelectedItem = None
-        self.remoteGeneratorSelectedLocalValue = -1
-        self.transferSwitchStateObj = None
-        self.transferSwitchNameObj = None
+        self.number_of_ac_inputs = None
+        self.ac_input_type_obj = None
+        self.current_limit_obj = None
+        self.current_limit_is_adjustable_obj = None
+        self.ignore_ac_in_1_obj = None
+        self.remote_generator_selected_item = None
+        self.remote_generator_selected_local_value = -1
         
-        # Sensor services
-        self.outdoor_temp_service_name = None
-        self.generator_temp_service_name = None
-        self.gps_service_name = None
+        # Signal match tracking for critical properties
+        self.active_matches = {}
+        
+        # Track discovered service names
+        self.outdoor_temp_service = None
+        self.generator_temp_service = None
+        self.gps_service = None
         self.transfer_switch_service = None
         self.gen_auto_current_service = None
+        
+        # Track if services have ever been found
+        self.vebus_found = False
+        self.transfer_switch_found = False
+        self.outdoor_temp_found = False
+        self.generator_temp_found = False
+        self.gps_found = False
+        self.gen_auto_current_found = False
         
         # Sensor values
         self.outdoor_temp_fahrenheit = self.DEFAULT_OUTDOOR_TEMP_F
@@ -160,22 +182,7 @@ class DynamicTransferSwitch:
         self.gen_auto_current_state = None
         self.previous_gen_auto_current_state = None
         
-        # Error logging flags
-        self.altitude_warning_logged = False
-        self.generator_temp_warning_logged = False
-        self.outdoor_temp_warning_logged = False
-        self.altitude_dbus_error_logged = False
-        
-        # Debouncing
-        self.debounce_timer = None
-        self.pending_generator_state = None
-        
-        # Service discovery
-        self.tsInputSearchDelay = 10
-        self.firstSearchDone = False
-        self.veBusFoundInitially = False
-        self.loggedVeBusInitialNotFound = False
-        self.dbusOk = False
+        # Service discovery state
         self.transferSwitchActive = False
         self.transferSwitchLocation = 0
         self.initial_derated_output_logged = False
@@ -184,7 +191,65 @@ class DynamicTransferSwitch:
         self.last_derated_active_limit = None
         self.last_derated_gen_setting = None
         
-        # D-Bus settings
+        # Setup D-Bus settings
+        self._setup_settings()
+        
+        # Setup name owner changed monitoring for critical services
+        self.bus.add_signal_receiver(
+            self._on_name_owner_changed,
+            bus_name="org.freedesktop.DBus",
+            dbus_interface="org.freedesktop.DBus",
+            signal_name="NameOwnerChanged"
+        )
+        
+        # Setup ItemsChanged monitoring for sensors and digital inputs (auto-recoverable)
+        self.items_changed_services = {}
+        
+        # Start service discovery
+        self._discovery_attempts = 0
+        GLib.idle_add(self._discover_services)
+        
+        # Add periodic status reporting (every 60 seconds) - DEBUG level
+        GLib.timeout_add_seconds(60, self._periodic_status)
+    
+    def _register_items_changed_service(self, service_name, callback):
+        """Register a service for ItemsChanged monitoring"""
+        if service_name in self.items_changed_services:
+            return
+        
+        try:
+            match = self.bus.add_signal_receiver(
+                lambda items, **kwargs: self._on_items_changed(items, kwargs, callback),
+                bus_name=service_name,
+                path="/",
+                dbus_interface="com.victronenergy.BusItem",
+                signal_name="ItemsChanged",
+                sender_keyword='sender_name'
+            )
+            self.items_changed_services[service_name] = match
+            logging.info(f"✅ ItemsChanged monitoring for {service_name}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to setup ItemsChanged for {service_name}: {e}")
+            return False
+    
+    def _on_items_changed(self, items, kwargs, callback):
+        """Handle ItemsChanged signals"""
+        if not self.startup_sync_complete:
+            return
+        
+        if not isinstance(items, dict):
+            return
+        
+        for path, changes in items.items():
+            if 'Value' in changes:
+                try:
+                    callback(path, changes['Value'])
+                except Exception as e:
+                    logging.error(f"Error in ItemsChanged callback: {e}")
+    
+    def _setup_settings(self):
+        """Setup D-Bus settings device"""
         settingsList = {
             'gridCurrentLimit': ['/Settings/TransferSwitch/GridCurrentLimit', 0.0, 0.0, 0.0],
             'generatorCurrentLimit': ['/Settings/TransferSwitch/GeneratorCurrentLimit', 0.0, 0.0, 0.0],
@@ -198,30 +263,31 @@ class DynamicTransferSwitch:
             bus=self.bus,
             supportedSettings=settingsList,
             timeout=10,
-            eventCallback=self.settings_changed
+            eventCallback=self._on_settings_device_changed
         )
         
-        if not self.validate_settings():
+        if not self._validate_settings():
             logging.error("Initial settings validation failed")
 
         if self.DbusSettings['gridInputType'] == 2:
             logging.warning("grid input type was generator - resetting to grid")
             self.DbusSettings['gridInputType'] = 1
         
-        # Start startup sequence (runs once)
-        GLib.idle_add(self._startup_sequence)
-        GLib.timeout_add_seconds(1, self.background)
-        
-        self.last_validation = time.time()
-        
+        # Subscribe to saved limits via PropertiesChanged
+        self._subscribe_to_saved_limits()
+    
+    def _on_settings_device_changed(self, setting, old_value, new_value):
+        """SettingsDevice callback - just for logging, sync handled by PropertiesChanged"""
+        logging.debug(f"SettingsDevice: {setting} = {new_value} (was {old_value})")
+    
     def _load_and_set_config(self):
         config = configparser.ConfigParser()
         
         # Defaults
         self.BASE_TEMPERATURE_THRESHOLD_F = 77.0
         self.TEMP_COEFFICIENT = 0.006
-        self.ALTITUDE_COEFFICIENT = 0.00003
-        self.BASE_GENERATOR_OUTPUT_AMPS = 62.5
+        self.ALTITUDE_COEFFICIENT = 0.000045
+        self.BASE_GENERATOR_OUTPUT_AMPS = 56.0
         self.OUTPUT_BUFFER = 0.9
         self.HIGH_GENTEMP_THRESHOLD_F = 220.0
         self.MEDIUM_GENTEMP_THRESHOLD_F = 212.0
@@ -230,7 +296,7 @@ class DynamicTransferSwitch:
         self.DEFAULT_ALTITUDE_FEET = 1000.0
         self.DEFAULT_GENERATOR_TEMP_F = 180.0
         self.DEFAULT_OUTDOOR_TEMP_F = 77.0
-        self.SHUTDOWN_TIMER_SECONDS = 5
+        self.SHUTDOWN_TIMER_SECONDS = 10
         self.extTransferDigInputName = "transfer switch"
         
         if not os.path.exists(CONFIG_FILE_PATH):
@@ -264,338 +330,362 @@ class DynamicTransferSwitch:
         except (configparser.Error, ValueError) as e:
             logging.error(f"Error reading config: {e}")
     
-    def _get_transfer_switch_state_direct(self):
-        """Directly read transfer switch state without updating internal state"""
-        if self.transferSwitchActive and self.transferSwitchStateObj:
+    # Critical Property Monitoring (PropertiesChanged with recovery)
+    def _subscribe_to_saved_limits(self):
+        """Subscribe to saved current limit changes using PropertiesChanged"""
+        # Generator current limit
+        gen_key = f"{SETTINGS_SERVICE_NAME}{GENERATOR_CURRENT_LIMIT_PATH}"
+        if gen_key not in self.active_matches:
             try:
-                state = self.transferSwitchStateObj.GetValue()
-                if state in (12, 3):
-                    return True  # Generator
-                elif state in (13, 2):
-                    return False  # Grid/Shore
+                match = self.bus.add_signal_receiver(
+                    lambda *args, **kwargs: self._on_generator_limit_changed(*args, **kwargs),
+                    bus_name=SETTINGS_SERVICE_NAME,
+                    path=GENERATOR_CURRENT_LIMIT_PATH,
+                    dbus_interface="com.victronenergy.BusItem",
+                    signal_name="PropertiesChanged",
+                    path_keyword='path',
+                    sender_keyword='sender_name'
+                )
+                self.active_matches[gen_key] = match
+                logging.info(f"✅ Subscribed to generator current limit")
             except Exception as e:
-                logging.debug(f"Error reading transfer switch state: {e}")
-        return None
+                logging.error(f"Failed to subscribe to generator limit: {e}")
+        
+        # Grid current limit
+        grid_key = f"{SETTINGS_SERVICE_NAME}{GRID_CURRENT_LIMIT_PATH}"
+        if grid_key not in self.active_matches:
+            try:
+                match = self.bus.add_signal_receiver(
+                    lambda *args, **kwargs: self._on_grid_limit_changed(*args, **kwargs),
+                    bus_name=SETTINGS_SERVICE_NAME,
+                    path=GRID_CURRENT_LIMIT_PATH,
+                    dbus_interface="com.victronenergy.BusItem",
+                    signal_name="PropertiesChanged",
+                    path_keyword='path',
+                    sender_keyword='sender_name'
+                )
+                self.active_matches[grid_key] = match
+                logging.info(f"✅ Subscribed to grid current limit")
+            except Exception as e:
+                logging.error(f"Failed to subscribe to grid limit: {e}")
     
-    def _startup_sequence(self):
-        """Run startup sequence exactly once"""
-        if self.startup_sequence_run or self.startup_sync_complete:
-            return False
+    def _subscribe_to_active_limit(self, service_name):
+        """Subscribe to active current limit changes using PropertiesChanged"""
+        key = f"{service_name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}"
         
-        self.startup_sequence_run = True
-        logging.info("=" * 60)
-        logging.info("STARTUP SEQUENCE - Discovering services")
-        logging.info("=" * 60)
-        
-        # Discover services with retries
-        for attempt in range(10):
-            logging.info(f"Discovery attempt {attempt + 1}/10")
-            
-            self._find_vebus_service()
-            self._find_transfer_switch_input_internal()
-            self._find_outdoor_temperature_service()
-            self._find_generator_temperature_service()
-            self._find_gps_service_internal()
-            self._find_gen_auto_current_input_internal()
-            
-            if self.vebus_service and self.transfer_switch_service:
-                logging.info("Required services found")
-                break
-            else:
-                missing = []
-                if not self.vebus_service:
-                    missing.append("VE.Bus")
-                if not self.transfer_switch_service:
-                    missing.append("Transfer Switch")
-                logging.warning(f"Missing: {', '.join(missing)}")
-                if attempt < 9:
-                    time.sleep(1)
-        
-        if not self.vebus_service or not self.transfer_switch_service:
-            logging.error("Required services not found - startup aborted")
-            self.startup_sync_complete = True
-            return False
-        
-        # Acquire lock for startup synchronization
-        lock_acquired = self.transfer_lock.acquire("startup", timeout=5)
-        if not lock_acquired:
-            logging.error("Could not acquire lock for startup")
-            self.startup_sync_complete = True
-            return False
+        if key in self.active_matches:
+            return
         
         try:
-            # Synchronize state
-            logging.info("=" * 60)
-            logging.info("STARTUP SYNCHRONIZATION")
-            logging.info("=" * 60)
+            match = self.bus.add_signal_receiver(
+                lambda *args, **kwargs: self._on_active_limit_changed(*args, **kwargs),
+                bus_name=service_name,
+                path=AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH,
+                dbus_interface="com.victronenergy.BusItem",
+                signal_name="PropertiesChanged",
+                path_keyword='path',
+                sender_keyword='sender_name'
+            )
+            self.active_matches[key] = match
+            self.vebus_service = service_name
+            logging.info(f"✅ Subscribed to active current limit on {service_name}")
             
-            # Wait for transfer switch state to stabilize
-            logging.info("Waiting for transfer switch state to stabilize...")
-            time.sleep(1)
-            
-            # Read transfer switch state multiple times directly to ensure stability
-            stable_count = 0
-            last_state = None
-            for i in range(5):
-                current_state = self._get_transfer_switch_state_direct()
-                if current_state is not None:
-                    if current_state == last_state:
-                        stable_count += 1
-                    else:
-                        stable_count = 0
-                        last_state = current_state
-                    logging.debug(f"State read {i+1}: {'GENERATOR' if current_state else 'GRID/SHORE'}")
-                time.sleep(0.2)
-            
-            if stable_count < 3:
-                logging.warning(f"Transfer switch state unstable, using last known state: {last_state}")
-            
-            transfer_switch_state = last_state if last_state is not None else False
-            
-            # Also update the internal onGenerator state
-            self.onGenerator = transfer_switch_state
-            
-            # Read current AC state
-            try:
-                current_input_type = self.acInputTypeObj.GetValue()
-                current_limit = self.currentLimitObj.GetValue() if self.currentLimitObj else None
-                logging.info(f"Current AC Input: {current_input_type} (1=Grid,2=Gen,3=Shore)")
-                logging.info(f"Current Limit: {current_limit}A")
-            except Exception as e:
-                logging.error(f"Failed to read AC state: {e}")
-                return False
-            
-            saved_grid_limit = self.DbusSettings['gridCurrentLimit']
-            saved_gen_limit = self.DbusSettings['generatorCurrentLimit']
-            saved_grid_type = self.DbusSettings['gridInputType']
-            
-            logging.info(f"Transfer Switch (stable): {'GENERATOR' if transfer_switch_state else 'GRID/SHORE'}")
-            logging.info(f"Saved Grid Limit: {saved_grid_limit}A")
-            logging.info(f"Saved Generator Limit: {saved_gen_limit}A")
-            
-            # Apply correct settings if needed
-            if transfer_switch_state:
-                # Should be on generator
-                if current_input_type != 2:
-                    logging.info("Applying generator settings...")
-                    try:
-                        self.acInputTypeObj.SetValue(wrap_dbus_value(2))
-                        if self.currentLimitIsAdjustableObj and self.currentLimitIsAdjustableObj.GetValue() == 1:
-                            self.currentLimitObj.SetValue(wrap_dbus_value(saved_gen_limit))
-                        time.sleep(1)
-                        logging.info("Generator settings applied during startup")
-                    except Exception as e:
-                        logging.error(f"Failed to apply generator settings: {e}")
-                else:
-                    logging.info("Already on GENERATOR")
-                    # Update saved limit from active if different
-                    if current_limit is not None and abs(current_limit - saved_gen_limit) > 0.5:
-                        logging.info(f"Updating saved generator limit from {saved_gen_limit}A to {current_limit}A")
-                        self.DbusSettings['generatorCurrentLimit'] = current_limit
-                
-                # Set initial state for monitoring
-                self.onGenerator = True
-                self.lastOnGenerator = True
-            else:
-                # Should be on grid/shore
-                if current_input_type != saved_grid_type:
-                    logging.info("Applying grid/shore settings...")
-                    try:
-                        self.acInputTypeObj.SetValue(wrap_dbus_value(saved_grid_type))
-                        if self.currentLimitIsAdjustableObj and self.currentLimitIsAdjustableObj.GetValue() == 1:
-                            self.currentLimitObj.SetValue(wrap_dbus_value(saved_grid_limit))
-                        time.sleep(1)
-                        logging.info("Grid/Shore settings applied during startup")
-                    except Exception as e:
-                        logging.error(f"Failed to apply grid settings: {e}")
-                else:
-                    logging.info("Already on GRID/SHORE")
-                    # Update saved limit from active if different
-                    if current_limit is not None and abs(current_limit - saved_grid_limit) > 0.5:
-                        logging.info(f"Updating saved grid limit from {saved_grid_limit}A to {current_limit}A")
-                        self.DbusSettings['gridCurrentLimit'] = current_limit
-                
-                # Set initial state for monitoring
-                self.onGenerator = False
-                self.lastOnGenerator = False
-            
-            # Read initial sensor values
-            self._read_initial_values()
-            
-            self.startup_sync_complete = True
-            logging.info("=" * 60)
-            logging.info("STARTUP COMPLETE - Normal operations")
-            logging.info("=" * 60)
-            
-            return False
-            
+            # Read initial value
+            self._read_initial_active_limit()
+            return True
         except Exception as e:
-            logging.error(f"Startup synchronization failed: {e}")
+            logging.error(f"Failed to subscribe to active limit: {e}")
             return False
-        finally:
-            # ALWAYS release the startup lock
-            self.transfer_lock.release("startup")
     
-    def _read_initial_values(self):
-        self._update_outdoor_temperature(log_update=False, log_initial=True)
-        self._update_altitude(log_update=False, log_initial=True)
-        self._update_generator_temperature(log_update=False, log_initial=True)
-        self._update_gen_auto_current_state(initial_read=True)
+    def _unsubscribe_from_active_limit(self, service_name):
+        """Unsubscribe from active current limit changes"""
+        key = f"{service_name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}"
+        
+        if key in self.active_matches:
+            try:
+                self.active_matches[key].remove()
+                del self.active_matches[key]
+                logging.info(f"🔴 Unsubscribed from active current limit on {service_name}")
+            except Exception as e:
+                logging.error(f"Failed to unsubscribe: {e}")
     
-    def _find_service(self, service_base):
-        services = [name for name in self.bus.list_names() if name.startswith(service_base)]
-        return services[0] if services else None
-    
-    def _find_vebus_service(self):
-        self.vebus_service = self._find_service(VEBUS_SERVICE_BASE)
+    def _read_initial_active_limit(self):
+        """Read initial active current limit value"""
         if self.vebus_service:
-            self._setup_vebus_objects()
-    
-    def _setup_vebus_objects(self):
-        try:
-            self.numberOfAcInputs = self.bus.get_object(self.vebus_service, "/Ac/NumberOfAcInputs").GetValue()
-            self.currentLimitObj = self.bus.get_object(self.vebus_service, "/Ac/ActiveIn/CurrentLimit")
-            self.currentLimitIsAdjustableObj = self.bus.get_object(self.vebus_service, "/Ac/ActiveIn/CurrentLimitIsAdjustable")
-            self.ignoreAcIn1Obj = self.bus.get_object(self.vebus_service, "/Ac/Control/IgnoreAcIn1")
-            
-            # Setup signal monitoring for active current limit
             try:
-                self.currentLimitObj.connect_to_signal("PropertiesChanged", self._active_limit_changed)
-                logging.info("Monitoring active current limit for changes")
+                # Use the standard BusItem interface
+                obj = self.bus.get_object(self.vebus_service, AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH)
+                iface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
+                value = iface.GetValue()
+                logging.info(f"📖 Initial active current limit: {value}A")
+                self._handle_active_limit_change(float(value))
             except Exception as e:
-                logging.debug(f"Could not monitor active limit: {e}")
-            
-            try:
-                self.remoteGeneratorSelectedItem = self.bus.get_object(self.vebus_service, "/Ac/Control/RemoteGeneratorSelected")
-            except:
-                self.remoteGeneratorSelectedItem = None
-            
-            logging.info(f"Discovered { 'Quattro' if self.numberOfAcInputs == 2 else 'MultiPlus' } at {self.vebus_service}")
-            self._setup_ac_input_objects()
-            self.dbusOk = True
-        except Exception as e:
-            logging.error(f"Failed to setup VE.Bus: {e}")
-            self.dbusOk = False
+                logging.error(f"Failed to read initial active limit: {e}")
     
-    def _active_limit_changed(self, *args):
-        """Called when active current limit changes externally"""
+    def _on_name_owner_changed(self, name, old_owner, new_owner):
+        """Handle service appearance/disappearance for critical properties"""
+        # Handle VE.Bus service (active current limit)
+        if name.startswith(VEBUS_SERVICE_BASE):
+            if new_owner and not old_owner:
+                logging.info(f"🟢 VE.Bus connected: {name}")
+                self._subscribe_to_active_limit(name)
+                # Also re-setup VE.Bus objects
+                if not self.vebus_service:
+                    self.vebus_service = name
+                    self._setup_vebus_objects()
+            elif old_owner and not new_owner:
+                logging.warning(f"🔴 VE.Bus disconnected: {name}")
+                self._unsubscribe_from_active_limit(name)
+                self.vebus_service = None
+        
+        # Handle Settings service (saved current limits)
+        elif name == SETTINGS_SERVICE_NAME:
+            if new_owner and not old_owner:
+                logging.info(f"🟢 Settings service connected: {name}")
+                self._subscribe_to_saved_limits()
+            elif old_owner and not new_owner:
+                logging.warning(f"🔴 Settings service disconnected: {name}")
+                for key in list(self.active_matches.keys()):
+                    if SETTINGS_SERVICE_NAME in key:
+                        try:
+                            self.active_matches[key].remove()
+                            del self.active_matches[key]
+                        except:
+                            pass
+                logging.info("🔴 Unsubscribed from saved current limits")
+    
+    # PropertiesChanged Callbacks
+    def _on_active_limit_changed(self, *args, **kwargs):
+        """Callback for active current limit changes"""
         if not self.startup_sync_complete:
             return
         
-        # Skip if a transfer is in progress
+        if args and isinstance(args[0], dict):
+            payload = args[0]
+            if 'Value' in payload:
+                new_limit = payload['Value']
+                logging.info(f"🔌 ACTIVE LIMIT CHANGE: {new_limit}A")
+                self._handle_active_limit_change(float(new_limit))
+    
+    def _on_generator_limit_changed(self, *args, **kwargs):
+        """Callback for generator current limit changes"""
+        if not self.startup_sync_complete:
+            return
+        
+        if args and isinstance(args[0], dict):
+            payload = args[0]
+            if 'Value' in payload:
+                new_limit = payload['Value']
+                logging.info(f"⚙️ GENERATOR LIMIT CHANGE: {new_limit}A")
+                self._handle_generator_limit_change(float(new_limit))
+    
+    def _on_grid_limit_changed(self, *args, **kwargs):
+        """Callback for grid current limit changes"""
+        if not self.startup_sync_complete:
+            return
+        
+        if args and isinstance(args[0], dict):
+            payload = args[0]
+            if 'Value' in payload:
+                new_limit = payload['Value']
+                logging.info(f"⚙️ GRID LIMIT CHANGE: {new_limit}A")
+                self._handle_grid_limit_change(float(new_limit))
+    
+    # Limit Change Handlers
+    def _handle_active_limit_change(self, new_limit):
+        """Handle active limit change - sync to saved settings"""
+        if self.transfer_state != TransferState.IDLE:
+            logging.debug(f"Active limit change ignored - transfer in progress")
+            return
+        
+        # Get current input type
+        try:
+            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
+        except Exception as e:
+            logging.error(f"Failed to get input type: {e}")
+            return
+        
+        # If Gen Auto is ON and generator is running, override
+        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self._is_generator_running():
+            logging.info("Gen Auto ON - overriding external change with derated value")
+            GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
+            GLib.idle_add(lambda: self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True))
+            return
+        
+        # Sync active limit to saved setting
+        if current_input_type == 2:  # On generator
+            if self.gen_auto_current_state != GEN_AUTO_CURRENT_ON:
+                current_saved = self.DbusSettings['generatorCurrentLimit']
+                if abs(new_limit - current_saved) > 0.1:
+                    logging.info(f"🔄 SYNC: Updating saved generator limit from {current_saved}A to {new_limit}A")
+                    self.DbusSettings['generatorCurrentLimit'] = new_limit
+                    self.last_derated_gen_setting = new_limit
+        elif current_input_type in (1, 3):  # On grid or shore
+            current_saved = self.DbusSettings['gridCurrentLimit']
+            if abs(new_limit - current_saved) > 0.1:
+                logging.info(f"🔄 SYNC: Updating saved grid limit from {current_saved}A to {new_limit}A")
+                self.DbusSettings['gridCurrentLimit'] = new_limit
+    
+    def _handle_generator_limit_change(self, new_limit):
+        """Handle saved generator limit change - sync to active if on generator"""
         if self.transfer_state != TransferState.IDLE:
             return
         
-        # If Gen Auto Current is ON and generator is running, override any external change
-        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self._is_generator_running():
-            logging.info("Active current limit changed externally while Gen Auto ON - overriding with derated value")
-            GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
-            # Also ensure saved generator limit is correct
+        # Update the settings device
+        self.DbusSettings['generatorCurrentLimit'] = new_limit
+        self.last_derated_gen_setting = new_limit
+        
+        # If Gen Auto is ON, override
+        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
+            logging.info("Gen Auto ON - overriding with derated value")
             GLib.idle_add(lambda: self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True))
-    
-    def _setup_ac_input_objects(self):
-        if self.numberOfAcInputs == 0:
-            loc = 0
-        elif self.numberOfAcInputs == 1:
-            loc = 1
-        elif self.DbusSettings.get('transferSwitchOnAc2', 0) == 1:
-            loc = 2
-        else:
-            loc = 1
-        
-        self.transferSwitchLocation = loc
-        
-        try:
-            if loc == 2:
-                self.acInputTypeObj = self.bus.get_object(SETTINGS_SERVICE_NAME, "/Settings/SystemSetup/AcInput2")
-            else:
-                self.acInputTypeObj = self.bus.get_object(SETTINGS_SERVICE_NAME, "/Settings/SystemSetup/AcInput1")
-        except Exception as e:
-            logging.error(f"AC input setup failed: {e}")
-    
-    def _get_dbus_value(self, service_name, path):
-        if not service_name:
-            return None, False
-        try:
-            obj = self.bus.get_object(service_name, path)
-            interface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
-            return interface.GetValue(), False
-        except dbus.exceptions.DBusException as e:
-            is_service_unknown = "DBus.Error.ServiceUnknown" in str(e)
-            return None, is_service_unknown
-        except Exception as e:
-            logging.error(f"Error getting {path}: {e}")
-            return None, False
-    
-    def _set_dbus_value(self, service_name, path, value):
-        if not service_name:
+            if self._is_generator_running():
+                GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
             return
-        try:
-            obj = self.bus.get_object(service_name, path)
-            interface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
-            interface.SetValue(wrap_dbus_value(value))
-            logging.debug(f"Set {path} to {value}")
-        except Exception as e:
-            logging.error(f"Failed to set {path}: {e}")
-    
-    def _find_outdoor_temperature_service(self):
-        """Find temperature sensor with 'outdoor' in custom name (case-insensitive)"""
-        self.outdoor_temp_service_name = None
-        for service in self.bus.list_names():
-            if service.startswith(TEMPERATURE_SERVICE_BASE):
-                try:
-                    obj = self.bus.get_object(service, CUSTOM_NAME_PATH)
-                    name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
-                    if name and "outdoor" in name.lower():
-                        self.outdoor_temp_service_name = service
-                        logging.info(f"Found outdoor temperature service at {service} with name '{name}'")
-                        return
-                except:
-                    pass
-    
-    def _find_generator_temperature_service(self):
-        """Find temperature sensor for generator with multiple patterns (case-insensitive)"""
-        self.generator_temp_service_name = None
-        search_patterns = ["gen", "generator", "gen temp", "generator temp"]
         
-        for service in self.bus.list_names():
-            if service.startswith(TEMPERATURE_SERVICE_BASE):
-                # Check CustomName
-                try:
-                    obj = self.bus.get_object(service, CUSTOM_NAME_PATH)
-                    name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
-                    if name:
-                        name_lower = name.lower()
-                        for pattern in search_patterns:
-                            if pattern in name_lower:
-                                self.generator_temp_service_name = service
-                                logging.info(f"Found generator temperature service at {service} with CustomName '{name}'")
-                                return
-                except:
-                    pass
-                
-                # Check ProductName
-                try:
-                    obj = self.bus.get_object(service, PRODUCT_NAME_PATH)
-                    name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
-                    if name:
-                        name_lower = name.lower()
-                        for pattern in search_patterns:
-                            if pattern in name_lower:
-                                self.generator_temp_service_name = service
-                                logging.info(f"Found generator temperature service at {service} with ProductName '{name}'")
-                                return
-                except:
-                    pass
+        # Apply to active limit if on generator
+        try:
+            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
+            if current_input_type == 2:
+                if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                    logging.info(f"🔄 SYNC: Applying generator limit {new_limit}A to active")
+                    self.current_limit_obj.SetValue(wrap_dbus_value(new_limit))
+                    self.last_derated_active_limit = new_limit
+        except Exception as e:
+            logging.error(f"Failed to apply generator limit to active: {e}")
     
-    def _find_gps_service_internal(self):
-        self.gps_service_name = self._find_service(GPS_SERVICE_BASE)
-        if self.gps_service_name:
-            logging.info(f"Found GPS service at {self.gps_service_name}")
+    def _handle_grid_limit_change(self, new_limit):
+        """Handle saved grid limit change - sync to active if on grid/shore"""
+        if self.transfer_state != TransferState.IDLE:
+            return
+        
+        # Update the settings device
+        self.DbusSettings['gridCurrentLimit'] = new_limit
+        
+        # Apply to active limit if on grid or shore
+        try:
+            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
+            if current_input_type in (1, 3):
+                if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                    logging.info(f"🔄 SYNC: Applying grid limit {new_limit}A to active")
+                    self.current_limit_obj.SetValue(wrap_dbus_value(new_limit))
+                    self.last_derated_active_limit = new_limit
+        except Exception as e:
+            logging.error(f"Failed to apply grid limit to active: {e}")
     
-    def _find_transfer_switch_input_internal(self):
-        """Find digital input configured as transfer switch (case-insensitive)"""
-        self.transfer_switch_service = None
+    # Service Discovery Methods
+    def _discover_services(self):
+        """Discover all required services"""
+        self._discovery_attempts += 1
+        logging.info(f"Service discovery attempt {self._discovery_attempts}")
+        
+        # Find VE.Bus service (required)
+        if not self.vebus_found:
+            if self._find_vebus_service():
+                self.vebus_found = True
+        
+        # Find transfer switch (required)
+        if not self.transfer_switch_found:
+            if self._find_transfer_switch_input():
+                self.transfer_switch_found = True
+        
+        # Find outdoor temperature sensor
+        if not self.outdoor_temp_found:
+            if self._find_outdoor_temperature_sensor():
+                self.outdoor_temp_found = True
+        
+        # Find generator temperature sensor
+        if not self.generator_temp_found:
+            if self._find_generator_temperature_sensor():
+                self.generator_temp_found = True
+        
+        # Find GPS
+        if not self.gps_found:
+            if self._find_gps_service():
+                self.gps_found = True
+        
+        # Find Gen Auto Current
+        if not self.gen_auto_current_found:
+            if self._find_gen_auto_current_input():
+                self.gen_auto_current_found = True
+        
+        # Check if we have required services
+        if self.vebus_found and self.transfer_switch_found:
+            if not self.startup_sync_complete:
+                self._perform_startup_sync()
+            
+            # Only retry for services that have NEVER been found
+            missing_optional = []
+            if not self.outdoor_temp_found:
+                missing_optional.append("outdoor_temp")
+            if not self.generator_temp_found:
+                missing_optional.append("generator_temp")
+            if not self.gps_found:
+                missing_optional.append("gps")
+            if not self.gen_auto_current_found:
+                missing_optional.append("gen_auto_current")
+            
+            if missing_optional:
+                logging.info(f"Still looking for optional services: {', '.join(missing_optional)}")
+                GLib.timeout_add_seconds(60, self._discover_services)
+            else:
+                logging.info("All services discovered - stopping discovery")
+                return
+        else:
+            missing_required = []
+            if not self.vebus_found:
+                missing_required.append("VE.Bus")
+            if not self.transfer_switch_found:
+                missing_required.append("Transfer Switch")
+            logging.warning(f"Required services missing: {', '.join(missing_required)} - retrying in 30s")
+            GLib.timeout_add_seconds(30, self._discover_services)
+    
+    def _find_vebus_service(self):
+        """Find VE.Bus service and subscribe to active limit"""
+        services = [name for name in self.bus.list_names() if name.startswith(VEBUS_SERVICE_BASE)]
+        if services:
+            self.vebus_service = services[0]
+            self._setup_vebus_objects()
+            self._subscribe_to_active_limit(self.vebus_service)
+            logging.info(f"✅ Found VE.Bus: {self.vebus_service}")
+            return True
+        return False
+    
+    def _setup_vebus_objects(self):
+        """Set up VE.Bus D-Bus objects"""
+        try:
+            obj = self.bus.get_object(self.vebus_service, NUMBER_OF_AC_INPUTS_PATH)
+            self.number_of_ac_inputs = obj.GetValue()
+            logging.info(f"Number of AC inputs: {self.number_of_ac_inputs}")
+            
+            self.current_limit_obj = self.bus.get_object(self.vebus_service, CURRENT_LIMIT_PATH)
+            self.current_limit_is_adjustable_obj = self.bus.get_object(self.vebus_service, CURRENT_LIMIT_IS_ADJUSTABLE_PATH)
+            self.ignore_ac_in_1_obj = self.bus.get_object(self.vebus_service, IGNORE_AC_IN_1_PATH)
+            
+            is_adjustable = self.current_limit_is_adjustable_obj.GetValue()
+            logging.info(f"Current limit adjustable: {is_adjustable}")
+            
+            try:
+                self.remote_generator_selected_item = self.bus.get_object(self.vebus_service, REMOTE_GENERATOR_SELECTED_PATH)
+            except:
+                self.remote_generator_selected_item = None
+            
+            # Setup AC input type
+            if self.number_of_ac_inputs == 2:
+                ac_input_path = AC_INPUT_2_PATH
+            else:
+                ac_input_path = AC_INPUT_1_PATH
+            
+            self.ac_input_type_obj = self.bus.get_object(SETTINGS_SERVICE_NAME, ac_input_path)
+            logging.info(f"AC input type path: {ac_input_path}")
+            logging.info(f"Initial AC input type: {self.ac_input_type_obj.GetValue()}")
+            
+            logging.info(f"Discovered {'Quattro' if self.number_of_ac_inputs == 2 else 'MultiPlus'}")
+        except Exception as e:
+            logging.error(f"Failed to setup VE.Bus: {e}")
+    
+    def _find_transfer_switch_input(self):
+        """Find digital input configured as transfer switch"""
         for service in self.bus.list_names():
             if service.startswith(DIGITAL_INPUT_SERVICE_BASE):
                 try:
@@ -603,17 +693,21 @@ class DynamicTransferSwitch:
                     name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
                     if name and "transfer switch" in name.lower():
                         self.transfer_switch_service = service
-                        self.transferSwitchNameObj = self.bus.get_object(service, '/CustomName')
-                        self.transferSwitchStateObj = self.bus.get_object(service, '/State')
                         self.transferSwitchActive = True
-                        logging.info(f"Found transfer switch at {service} with product name '{name}'")
-                        return
+                        
+                        self._register_items_changed_service(
+                            service,
+                            self._on_transfer_switch_value
+                        )
+                        
+                        logging.info(f"✅ Found transfer switch: {service}")
+                        return True
                 except:
                     pass
+        return False
     
-    def _find_gen_auto_current_input_internal(self):
-        """Find digital input for Gen Auto Current enable/disable (case-insensitive)"""
-        self.gen_auto_current_service = None
+    def _find_gen_auto_current_input(self):
+        """Find digital input for Gen Auto Current"""
         for service in self.bus.list_names():
             if service.startswith(DIGITAL_INPUT_SERVICE_BASE):
                 try:
@@ -621,178 +715,419 @@ class DynamicTransferSwitch:
                     name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
                     if name and "gen auto current" in name.lower():
                         self.gen_auto_current_service = service
-                        logging.info(f"Found Gen Auto Current at {service} with product name '{name}'")
-                        return
+                        
+                        self._register_items_changed_service(
+                            service,
+                            self._on_gen_auto_current_value
+                        )
+                        
+                        # Get initial state
+                        try:
+                            state_obj = self.bus.get_object(service, STATE_PATH)
+                            state_iface = dbus.Interface(state_obj, BUS_ITEM_INTERFACE)
+                            state = state_iface.GetValue()
+                            if state is not None:
+                                self.gen_auto_current_state = int(state)
+                                logging.info(f"✅ Found Gen Auto Current: {service} - Initial state: {'ON' if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON else 'OFF'}")
+                                
+                                if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
+                                    logging.info("Gen Auto Current enabled - forcing derating")
+                                    GLib.idle_add(self._force_derating)
+                        except Exception as e:
+                            logging.error(f"Failed to read initial Gen Auto state: {e}")
+                        
+                        return True
                 except:
                     pass
+        return False
     
-    def _check_service_health(self):
-        """Check if discovered services are still responding"""
-        # Check outdoor temperature service
-        if self.outdoor_temp_service_name:
-            try:
-                self.bus.get_object(self.outdoor_temp_service_name, TEMPERATURE_PATH)
-            except:
-                logging.warning(f"Outdoor temperature service {self.outdoor_temp_service_name} no longer available")
-                self.outdoor_temp_service_name = None
-        
-        # Check generator temperature service
-        if self.generator_temp_service_name:
-            try:
-                self.bus.get_object(self.generator_temp_service_name, TEMPERATURE_PATH)
-            except:
-                logging.warning(f"Generator temperature service {self.generator_temp_service_name} no longer available")
-                self.generator_temp_service_name = None
-        
-        # Check GPS service
-        if self.gps_service_name:
-            try:
-                self.bus.get_object(self.gps_service_name, ALTITUDE_PATH)
-            except:
-                logging.warning(f"GPS service {self.gps_service_name} no longer available")
-                self.gps_service_name = None
-        
-        # Check Gen Auto Current service
-        if self.gen_auto_current_service:
-            try:
-                self.bus.get_object(self.gen_auto_current_service, STATE_PATH)
-            except:
-                logging.warning(f"Gen Auto Current service {self.gen_auto_current_service} no longer available")
-                self.gen_auto_current_service = None
-    
-    def _update_outdoor_temperature(self, log_update=True, log_initial=False):
-        if self.outdoor_temp_service_name:
-            temp_c, is_error = self._get_dbus_value(self.outdoor_temp_service_name, TEMPERATURE_PATH)
-            if temp_c is not None:
-                self.outdoor_temp_fahrenheit = (temp_c * 9/5) + 32
-                if log_initial:
-                    logging.info(f"Initial Outdoor Temp: {self.outdoor_temp_fahrenheit:.1f}F")
-                elif log_update:
-                    logging.debug(f"Outdoor Temp: {self.outdoor_temp_fahrenheit:.1f}F")
-            elif is_error:
-                logging.debug(f"Outdoor temperature service {self.outdoor_temp_service_name} unavailable")
-                self.outdoor_temp_service_name = None
-        else:
-            if log_initial:
-                logging.info(f"No outdoor sensor - using default: {self.outdoor_temp_fahrenheit:.1f}F")
-    
-    def _update_altitude(self, log_update=True, log_initial=False):
-        if self.gps_service_name:
-            alt, is_error = self._get_dbus_value(self.gps_service_name, ALTITUDE_PATH)
-            if alt is not None:
+    def _find_outdoor_temperature_sensor(self):
+        """Find temperature sensor with 'outdoor' in custom name"""
+        for service in self.bus.list_names():
+            if service.startswith(TEMPERATURE_SERVICE_BASE):
                 try:
-                    if isinstance(alt, dbus.Array):
-                        alt_m = float(alt[0]) if alt else None
-                    else:
-                        alt_m = float(alt)
-                    if alt_m is not None:
-                        self.altitude_feet = alt_m * 3.28084
-                        if log_initial:
-                            logging.info(f"Initial Altitude: {self.altitude_feet:.0f}ft")
-                        elif log_update:
-                            logging.debug(f"Altitude: {self.altitude_feet:.0f}ft")
+                    obj = self.bus.get_object(service, CUSTOM_NAME_PATH)
+                    name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
+                    if name and "outdoor" in name.lower():
+                        self.outdoor_temp_service = service
+                        
+                        self._register_items_changed_service(
+                            service,
+                            self._on_outdoor_temp_value
+                        )
+                        
+                        logging.info(f"✅ Found outdoor temp sensor: {service}")
+                        
+                        # Get initial value
+                        try:
+                            temp_obj = self.bus.get_object(service, TEMPERATURE_PATH)
+                            temp_iface = dbus.Interface(temp_obj, BUS_ITEM_INTERFACE)
+                            temp_c = temp_iface.GetValue()
+                            if temp_c is not None:
+                                self.outdoor_temp_fahrenheit = (temp_c * 9/5) + 32
+                                logging.info(f"   Initial value: {self.outdoor_temp_fahrenheit:.1f}F")
+                                GLib.idle_add(self._trigger_derating)
+                        except Exception as e:
+                            logging.error(f"Failed to read initial temp: {e}")
+                        
+                        return True
+                except:
+                    continue
+        return False
+    
+    def _find_generator_temperature_sensor(self):
+        """Find temperature sensor for generator"""
+        search_patterns = ["gen", "generator", "gen temp", "generator temp"]
+        
+        for service in self.bus.list_names():
+            if service.startswith(TEMPERATURE_SERVICE_BASE):
+                try:
+                    obj = self.bus.get_object(service, CUSTOM_NAME_PATH)
+                    name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
+                    if name:
+                        name_lower = name.lower()
+                        for pattern in search_patterns:
+                            if pattern in name_lower:
+                                self.generator_temp_service = service
+                                
+                                self._register_items_changed_service(
+                                    service,
+                                    self._on_generator_temp_value
+                                )
+                                
+                                logging.info(f"✅ Found generator temp sensor: {service}")
+                                
+                                # Get initial value
+                                try:
+                                    temp_obj = self.bus.get_object(service, TEMPERATURE_PATH)
+                                    temp_iface = dbus.Interface(temp_obj, BUS_ITEM_INTERFACE)
+                                    temp_c = temp_iface.GetValue()
+                                    if temp_c is not None:
+                                        self.generator_temp_fahrenheit = (temp_c * 9/5) + 32
+                                        logging.info(f"   Initial value: {self.generator_temp_fahrenheit:.1f}F")
+                                        GLib.idle_add(self._trigger_derating)
+                                except Exception as e:
+                                    logging.error(f"Failed to read initial temp: {e}")
+                                
+                                return True
                 except:
                     pass
-            elif is_error:
-                logging.debug(f"GPS service {self.gps_service_name} unavailable")
-                self.gps_service_name = None
-        else:
-            if log_initial:
-                logging.info(f"No GPS - using default altitude: {self.altitude_feet:.0f}ft")
+                
+                try:
+                    obj = self.bus.get_object(service, PRODUCT_NAME_PATH)
+                    name = dbus.Interface(obj, BUS_ITEM_INTERFACE).GetValue()
+                    if name:
+                        name_lower = name.lower()
+                        for pattern in search_patterns:
+                            if pattern in name_lower:
+                                self.generator_temp_service = service
+                                
+                                self._register_items_changed_service(
+                                    service,
+                                    self._on_generator_temp_value
+                                )
+                                
+                                logging.info(f"✅ Found generator temp sensor: {service}")
+                                
+                                # Get initial value
+                                try:
+                                    temp_obj = self.bus.get_object(service, TEMPERATURE_PATH)
+                                    temp_iface = dbus.Interface(temp_obj, BUS_ITEM_INTERFACE)
+                                    temp_c = temp_iface.GetValue()
+                                    if temp_c is not None:
+                                        self.generator_temp_fahrenheit = (temp_c * 9/5) + 32
+                                        logging.info(f"   Initial value: {self.generator_temp_fahrenheit:.1f}F")
+                                        GLib.idle_add(self._trigger_derating)
+                                except Exception as e:
+                                    logging.error(f"Failed to read initial temp: {e}")
+                                
+                                return True
+                except:
+                    pass
+        return False
     
-    def _update_generator_temperature(self, log_update=True, log_initial=False):
-        if self.generator_temp_service_name:
-            temp_c, is_error = self._get_dbus_value(self.generator_temp_service_name, TEMPERATURE_PATH)
-            if temp_c is not None:
-                self.generator_temp_fahrenheit = (temp_c * 9/5) + 32
-                if log_initial:
-                    logging.info(f"Initial Generator Temp: {self.generator_temp_fahrenheit:.1f}F")
-                elif log_update:
-                    logging.debug(f"Generator Temp: {self.generator_temp_fahrenheit:.1f}F")
-            elif is_error:
-                logging.debug(f"Generator temperature service {self.generator_temp_service_name} unavailable")
-                self.generator_temp_service_name = None
-        else:
-            if log_initial:
-                logging.info(f"No gen temp sensor - using default: {self.generator_temp_fahrenheit:.1f}F")
+    def _find_gps_service(self):
+        """Find GPS service for altitude"""
+        services = [name for name in self.bus.list_names() if name.startswith(GPS_SERVICE_BASE)]
+        if services:
+            self.gps_service = services[0]
+            
+            self._register_items_changed_service(
+                self.gps_service,
+                self._on_altitude_value
+            )
+            
+            logging.info(f"✅ Found GPS: {self.gps_service}")
+            
+            # Get initial value
+            try:
+                alt_obj = self.bus.get_object(self.gps_service, ALTITUDE_PATH)
+                alt_iface = dbus.Interface(alt_obj, BUS_ITEM_INTERFACE)
+                alt = alt_iface.GetValue()
+                if alt is not None:
+                    try:
+                        if isinstance(alt, dbus.Array):
+                            alt_m = float(alt[0]) if alt else None
+                        else:
+                            alt_m = float(alt)
+                        if alt_m is not None:
+                            self.altitude_feet = alt_m * 3.28084
+                            logging.info(f"   Initial altitude: {self.altitude_feet:.0f}ft")
+                            GLib.idle_add(self._trigger_derating)
+                    except:
+                        pass
+            except:
+                pass
+            
+            return True
+        return False
     
-    def _update_gen_auto_current_state(self, initial_read=False):
-        if self.gen_auto_current_service:
-            state, is_error = self._get_dbus_value(self.gen_auto_current_service, STATE_PATH)
-            if state is not None:
-                state = int(state)
-                if initial_read:
-                    self.gen_auto_current_state = state
-                    self.previous_gen_auto_current_state = state
-                    logging.info(f"Gen Auto Current: {'ON' if state == GEN_AUTO_CURRENT_ON else 'OFF'}")
-                elif state != self.previous_gen_auto_current_state:
-                    old_state = self.previous_gen_auto_current_state
-                    self.previous_gen_auto_current_state = self.gen_auto_current_state
-                    self.gen_auto_current_state = state
-                    logging.info(f"Gen Auto Current changed from {'ON' if old_state == GEN_AUTO_CURRENT_ON else 'OFF'} to {'ON' if state == GEN_AUTO_CURRENT_ON else 'OFF'}")
-                    
-                    # If changed from OFF to ON and startup is complete, force derating immediately
-                    if old_state != GEN_AUTO_CURRENT_ON and state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
-                        logging.info("Gen Auto Current enabled - forcing immediate derating")
-                        GLib.idle_add(self._force_derating)
-                else:
-                    self.gen_auto_current_state = state
-            elif is_error and not initial_read:
-                # Service became unavailable
-                logging.debug(f"Gen Auto Current service {self.gen_auto_current_service} unavailable")
-                self.gen_auto_current_service = None
-        elif not initial_read:
-            # Periodically try to rediscover
-            self._find_gen_auto_current_input_internal()
+    # ItemsChanged Callbacks (Sensors and Digital Inputs)
+    def _on_transfer_switch_value(self, path, value):
+        """Handle transfer switch value changes"""
+        if path != STATE_PATH:
+            return
         
-        if initial_read and not self.gen_auto_current_service:
-            logging.info("Gen Auto Current input not found - derating disabled")
+        new_state = value
+        logging.info(f"Transfer switch state changed: {new_state}")
+        
+        if new_state in (12, 3):
+            new_onGenerator = True
+        elif new_state in (13, 2):
+            new_onGenerator = False
+        else:
+            return
+        
+        if new_onGenerator != self.onGenerator:
+            self.onGenerator = new_onGenerator
+            logging.info(f"Transfer switch confirmed: {'GENERATOR' if self.onGenerator else 'GRID'}")
+            
+            self.update_remote_generator_selected()
+            
+            if self.onGenerator:
+                if self.transfer_lock.acquire("transfer_switch", timeout=2):
+                    try:
+                        self._transfer_to_generator()
+                    finally:
+                        self.transfer_lock.release("transfer_switch")
+            else:
+                if self.transfer_lock.acquire("transfer_switch", timeout=2):
+                    try:
+                        self._transfer_to_grid()
+                    except Exception as e:
+                        logging.error(f"Error during grid transfer: {e}")
+                        self.transfer_lock.release("transfer_switch")
     
-    def _force_derating(self):
-        """Force derating to run immediately on both active and saved generator limits"""
+    def _on_gen_auto_current_value(self, path, value):
+        """Handle Gen Auto Current value changes"""
+        if path != STATE_PATH:
+            return
+        
+        new_state = int(value)
+        old_state = self.gen_auto_current_state
+        self.gen_auto_current_state = new_state
+        
+        logging.info(f"Gen Auto Current: {'ON' if new_state == GEN_AUTO_CURRENT_ON else 'OFF'}")
+        
+        if new_state == GEN_AUTO_CURRENT_ON:
+            logging.info("Gen Auto Current enabled - forcing derating")
+            GLib.idle_add(self._force_derating)
+        else:
+            logging.info("Gen Auto Current disabled - reverting to saved limit")
+            GLib.idle_add(self._revert_to_saved_limit)
+    
+    def _on_outdoor_temp_value(self, path, value):
+        """Handle outdoor temperature value changes"""
+        if path != TEMPERATURE_PATH:
+            return
+        
+        temp_c = value
+        temp_f = (temp_c * 9/5) + 32
+        old_temp = self.outdoor_temp_fahrenheit
+        self.outdoor_temp_fahrenheit = temp_f
+        logging.info(f"🌡️ Outdoor temp: {old_temp:.1f}F -> {temp_f:.1f}F")
+        GLib.idle_add(self._trigger_derating)
+    
+    def _on_generator_temp_value(self, path, value):
+        """Handle generator temperature value changes"""
+        if path != TEMPERATURE_PATH:
+            return
+        
+        temp_c = value
+        temp_f = (temp_c * 9/5) + 32
+        old_temp = self.generator_temp_fahrenheit
+        self.generator_temp_fahrenheit = temp_f
+        logging.info(f"🔧 Generator temp: {old_temp:.1f}F -> {temp_f:.1f}F")
+        GLib.idle_add(self._trigger_derating)
+    
+    def _on_altitude_value(self, path, value):
+        """Handle altitude value changes"""
+        if path != ALTITUDE_PATH:
+            return
+        
+        try:
+            if isinstance(value, dbus.Array):
+                alt_m = float(value[0]) if value else None
+            else:
+                alt_m = float(value)
+            if alt_m is not None:
+                old_alt = self.altitude_feet
+                self.altitude_feet = alt_m * 3.28084
+                if abs(old_alt - self.altitude_feet) > 10:
+                    logging.info(f"🗻 Altitude: {old_alt:.0f}ft -> {self.altitude_feet:.0f}ft")
+                GLib.idle_add(self._trigger_derating)
+        except Exception as e:
+            logging.debug(f"Error processing altitude: {e}")
+    
+    # Startup and Core Functions
+    def _perform_startup_sync(self):
+        """Perform initial synchronization after discovery"""
+        logging.info("=" * 60)
+        logging.info("STARTUP SYNCHRONIZATION")
+        logging.info("=" * 60)
+        
+        lock_acquired = self.transfer_lock.acquire("startup", timeout=5)
+        if not lock_acquired:
+            logging.error("Could not acquire lock for startup")
+            self.startup_sync_complete = True
+            return
+        
+        try:
+            time.sleep(2)
+            
+            # Get current values from D-Bus directly
+            if self.transfer_switch_service:
+                obj = self.bus.get_object(self.transfer_switch_service, STATE_PATH)
+                iface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
+                state = iface.GetValue()
+                if state in (12, 3):
+                    self.onGenerator = True
+                elif state in (13, 2):
+                    self.onGenerator = False
+                logging.info(f"Transfer Switch: {'GENERATOR' if self.onGenerator else 'GRID/SHORE'}")
+            
+            # Read current AC state
+            try:
+                current_input_type = self.ac_input_type_obj.GetValue()
+                current_limit = self.current_limit_obj.GetValue() if self.current_limit_obj else None
+                logging.info(f"Current AC Input: {current_input_type}")
+                logging.info(f"Current Active Limit: {current_limit}A")
+            except Exception as e:
+                logging.error(f"Failed to read AC state: {e}")
+                return
+            
+            saved_grid_limit = self.DbusSettings['gridCurrentLimit']
+            saved_gen_limit = self.DbusSettings['generatorCurrentLimit']
+            saved_grid_type = self.DbusSettings['gridInputType']
+            
+            logging.info(f"Saved Grid Limit: {saved_grid_limit}A")
+            logging.info(f"Saved Generator Limit: {saved_gen_limit}A")
+            
+            # Apply correct settings
+            if self.onGenerator:
+                if current_input_type != 2:
+                    logging.info("Applying generator settings...")
+                    try:
+                        self.ac_input_type_obj.SetValue(wrap_dbus_value(2))
+                        if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                            self.current_limit_obj.SetValue(wrap_dbus_value(saved_gen_limit))
+                        time.sleep(1)
+                        logging.info("Generator settings applied")
+                    except Exception as e:
+                        logging.error(f"Failed to apply generator settings: {e}")
+            else:
+                if current_input_type != saved_grid_type:
+                    logging.info("Applying grid/shore settings...")
+                    try:
+                        self.ac_input_type_obj.SetValue(wrap_dbus_value(saved_grid_type))
+                        if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                            self.current_limit_obj.SetValue(wrap_dbus_value(saved_grid_limit))
+                        time.sleep(1)
+                        logging.info("Grid/Shore settings applied")
+                    except Exception as e:
+                        logging.error(f"Failed to apply grid settings: {e}")
+            
+            self.startup_sync_complete = True
+            logging.info("=" * 60)
+            logging.info("STARTUP COMPLETE - Normal operations")
+            logging.info("=" * 60)
+            
+            GLib.idle_add(self._trigger_derating)
+            
+        except Exception as e:
+            logging.error(f"Startup synchronization failed: {e}")
+        finally:
+            self.transfer_lock.release("startup")
+    
+    def _is_generator_running(self):
+        """Check if generator is currently running"""
+        if self.transfer_switch_service:
+            try:
+                obj = self.bus.get_object(self.transfer_switch_service, STATE_PATH)
+                iface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
+                state = iface.GetValue()
+                return state in GENERATOR_ON_VALUE
+            except:
+                pass
+        return False
+    
+    def _trigger_derating(self):
+        """Trigger derating calculation"""
         if not self.startup_sync_complete:
-            logging.debug("Startup not complete - skipping force derating")
             return
         
         if self.transfer_state != TransferState.IDLE:
-            logging.debug("Transfer in progress - delaying force derating")
-            # Try again in 1 second
+            return
+        
+        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
+            if self._is_generator_running():
+                self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=False)
+                self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=False)
+            else:
+                self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=False)
+    
+    def _force_derating(self):
+        """Force derating update"""
+        if not self.startup_sync_complete:
+            return
+        
+        if self.transfer_state != TransferState.IDLE:
             GLib.timeout_add_seconds(1, self._force_derating)
             return
         
-        logging.info("Executing force derating update")
+        logging.info("Forcing derating update")
         
         if self._is_generator_running():
-            # Generator is running - update both active limit and saved generator limit
             self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True)
             self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True)
         else:
-            # Generator not running - only update saved generator limit
             self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True)
     
-    def _is_generator_running(self):
-        if self.transfer_switch_service:
-            state, _ = self._get_dbus_value(self.transfer_switch_service, STATE_PATH)
-            return state in GENERATOR_ON_VALUE if state else False
-        return False
+    def _revert_to_saved_limit(self):
+        """Revert to saved generator limit"""
+        if self._is_generator_running():
+            saved_limit = self.DbusSettings['generatorCurrentLimit']
+            logging.info(f"Reverting to saved generator limit: {saved_limit}A")
+            if self.vebus_service:
+                self._set_dbus_value(self.vebus_service, AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, saved_limit)
+                self.last_derated_active_limit = saved_limit
     
     def calculate_derating_factor(self, temp_f, alt_ft, gen_temp_f):
-        """Calculate derated output - EXACT match to original script"""
+        """Calculate derated output"""
         temperature_multiplier = 1.0
         altitude_multiplier = 1.0
         generator_temp_multiplier = 1.0
         
-        if temp_f is not None:
-            if temp_f > self.BASE_TEMPERATURE_THRESHOLD_F:
-                temp_diff = temp_f - self.BASE_TEMPERATURE_THRESHOLD_F
-                temperature_multiplier = 1.0 - (temp_diff * self.TEMP_COEFFICIENT)
-                if temperature_multiplier < 0.0:
-                    temperature_multiplier = 0.0
+        if temp_f is not None and temp_f > self.BASE_TEMPERATURE_THRESHOLD_F:
+            temp_diff = temp_f - self.BASE_TEMPERATURE_THRESHOLD_F
+            temp_reduction = temp_diff * self.TEMP_COEFFICIENT
+            temperature_multiplier = 1.0 - temp_reduction
+            temperature_multiplier = max(0.0, temperature_multiplier)
         
         if alt_ft is not None:
-            altitude_multiplier = 1.0 - (alt_ft * self.ALTITUDE_COEFFICIENT)
-            if altitude_multiplier < 0.0:
-                altitude_multiplier = 0.0
+            alt_reduction = alt_ft * self.ALTITUDE_COEFFICIENT
+            altitude_multiplier = 1.0 - alt_reduction
+            altitude_multiplier = max(0.0, altitude_multiplier)
         
         if gen_temp_f is not None:
             if gen_temp_f >= self.HIGH_GENTEMP_THRESHOLD_F:
@@ -800,35 +1135,23 @@ class DynamicTransferSwitch:
             elif gen_temp_f >= self.MEDIUM_GENTEMP_THRESHOLD_F:
                 generator_temp_multiplier = self.MEDIUM_GENTEMP_REDUCTION
         
-        # Calculate in the exact same order as original script
-        # Original: derated_output_amps = BASE_GENERATOR_OUTPUT_AMPS * temp_mult * alt_mult * gen_temp_mult * OUTPUT_BUFFER
         derated = self.BASE_GENERATOR_OUTPUT_AMPS
         derated = derated * temperature_multiplier
         derated = derated * altitude_multiplier
         derated = derated * generator_temp_multiplier
         derated = derated * self.OUTPUT_BUFFER
         
-        # Round to 1 decimal place
-        rounded = round(derated, 1)
-        
-        # Debug logging
-        logging.debug(f"Derating calc: {self.BASE_GENERATOR_OUTPUT_AMPS} * {temperature_multiplier:.6f} * {altitude_multiplier:.6f} * {generator_temp_multiplier} * {self.OUTPUT_BUFFER} = {derated:.4f} -> {rounded:.1f}A")
-        
-        return rounded
+        return round(derated, 1)
     
     def _perform_derating(self, target_path, force=False):
-        """Calculate derated value and write to specified D-Bus path"""
-        # Don't perform derating until startup is complete
+        """Calculate and apply derated value"""
         if not self.startup_sync_complete:
             return
         
-        # Skip if a transfer is in progress (check state only, not lock)
         if self.transfer_state != TransferState.IDLE:
-            logging.debug("Transfer in progress - skipping derating")
             return
         
         try:
-            # Calculate derated value using the exact method
             derated = self.calculate_derating_factor(
                 self.outdoor_temp_fahrenheit, self.altitude_feet, self.generator_temp_fahrenheit
             )
@@ -846,249 +1169,139 @@ class DynamicTransferSwitch:
             
             current, _ = self._get_dbus_value(service, target_path)
             
-            # Use small threshold for comparison
             if current is None or abs(float(current) - derated) > 0.05 or force:
                 self._set_dbus_value(service, target_path, derated)
-                logging.info(f"{desc} updated to {derated}A (derated){' - FORCED' if force else ''}")
+                logging.info(f"💡 {desc} updated to {derated}A")
                 
-                # Update last known values to prevent duplicate sync
                 if target_path == GENERATOR_CURRENT_LIMIT_PATH:
                     self.last_derated_gen_setting = derated
                 else:
                     self.last_derated_active_limit = derated
-                    # Also update the last derated gen setting to match if we're writing to active limit
-                    if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self._is_generator_running():
-                        if self.last_derated_gen_setting != derated:
-                            self.last_derated_gen_setting = derated
                     
         except Exception as e:
-            logging.error(f"Derating calculation failed: {e}")
+            logging.error(f"Derating failed: {e}")
     
-    def settings_changed(self, setting, old_value, new_value):
-        # Skip during startup
-        if not self.startup_sync_complete:
+    def _periodic_status(self):
+        """Periodic status report - DEBUG level"""
+        if self.startup_sync_complete:
+            current_active = None
+            try:
+                if self.current_limit_obj:
+                    current_active = self.current_limit_obj.GetValue()
+            except:
+                pass
+            
+            logging.debug(f"📊 STATUS - Gen Auto: {self.gen_auto_current_state} ({'ON' if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON else 'OFF'}), "
+                         f"Active Limit: {current_active}A, "
+                         f"Saved Grid: {self.DbusSettings['gridCurrentLimit']}A, "
+                         f"Saved Gen: {self.DbusSettings['generatorCurrentLimit']}A, "
+                         f"Outdoor: {self.outdoor_temp_fahrenheit:.1f}F, "
+                         f"Gen Temp: {self.generator_temp_fahrenheit:.1f}F, "
+                         f"Gen Running: {self._is_generator_running()}")
+        return True
+    
+    def _get_dbus_value(self, service_name, path):
+        """Get D-Bus value"""
+        if not service_name:
+            return None, False
+        try:
+            obj = self.bus.get_object(service_name, path)
+            interface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
+            return interface.GetValue(), False
+        except:
+            return None, False
+    
+    def _set_dbus_value(self, service_name, path, value):
+        """Set D-Bus value"""
+        if not service_name:
             return
-        
-        # Skip if a transfer is in progress
-        if self.transfer_state != TransferState.IDLE:
-            logging.debug(f"Transfer in progress - ignoring {setting} change")
-            return
-        
-        logging.debug(f"Setting {setting}: {old_value} -> {new_value}")
-        
-        # If Gen Auto Current is ON, override changes to saved generator limit
-        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
-            if setting == 'generatorCurrentLimit':
-                logging.info(f"Gen Auto ON - overriding generator saved limit change from {old_value}A to {new_value}A")
-                GLib.idle_add(lambda: self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True))
-                # If generator is running, also override active limit
-                if self._is_generator_running():
-                    GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
-                return
-        
-        # Normal handling for when Gen Auto Current is OFF
-        if setting == 'generatorCurrentLimit' and self.dbusOk and self.transferSwitchActive:
-            try:
-                inp = self.acInputTypeObj.GetValue() if self.acInputTypeObj else None
-                if inp == 2 and self.currentLimitIsAdjustableObj and self.currentLimitIsAdjustableObj.GetValue() == 1:
-                    logging.info(f"Applying gen limit {new_value}A to active")
-                    self.currentLimitObj.SetValue(wrap_dbus_value(new_value))
-                    # Update last known value
-                    self.last_derated_active_limit = new_value
-            except Exception as e:
-                logging.error(f"Failed to apply gen limit: {e}")
-        
-        elif setting == 'gridCurrentLimit' and self.dbusOk and self.transferSwitchActive:
-            try:
-                inp = self.acInputTypeObj.GetValue() if self.acInputTypeObj else None
-                if inp in (1, 3) and self.currentLimitIsAdjustableObj and self.currentLimitIsAdjustableObj.GetValue() == 1:
-                    logging.info(f"Applying grid limit {new_value}A to active")
-                    self.currentLimitObj.SetValue(wrap_dbus_value(new_value))
-                    # Update last known value
-                    self.last_derated_active_limit = new_value
-            except Exception as e:
-                logging.error(f"Failed to apply grid limit: {e}")
+        try:
+            obj = self.bus.get_object(service_name, path)
+            interface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
+            interface.SetValue(wrap_dbus_value(value))
+        except Exception as e:
+            logging.error(f"Failed to set {path}: {e}")
     
-    def verify_settings_change(self, expected_type, expected_limit, source):
-        for attempt in range(5):
-            try:
-                actual_type = self.acInputTypeObj.GetValue()
-                actual_limit = self.currentLimitObj.GetValue() if self.currentLimitIsAdjustableObj and self.currentLimitIsAdjustableObj.GetValue() == 1 else None
-                
-                if actual_type == expected_type and (actual_limit is None or abs(actual_limit - expected_limit) <= 0.5):
-                    logging.info(f"✓ {source} verified (type={actual_type}, limit={actual_limit})")
-                    return True
-                
-                logging.warning(f"Retry {attempt+1}/5 for {source}")
-                if actual_type != expected_type:
-                    self.acInputTypeObj.SetValue(wrap_dbus_value(expected_type))
-                if actual_limit and abs(actual_limit - expected_limit) > 0.5:
-                    self.currentLimitObj.SetValue(wrap_dbus_value(expected_limit))
-                time.sleep(1)
-            except Exception as e:
-                logging.error(f"Verification error: {e}")
-        
-        logging.error(f"✗ {source} verification failed")
-        return False
-    
-    def transfer_to_generator(self, lock_holder=None):
-        """Transfer to generator - assumes lock is already held by caller"""
-        if not self.dbusOk or not self.transferSwitchActive:
-            return False
-        
-        # Verify lock is held by the caller
-        if lock_holder is None or not self.transfer_lock.is_held_by(lock_holder):
-            logging.error("transfer_to_generator called without lock being held")
-            return False
-        
+    def _transfer_to_generator(self):
+        """Transfer to generator"""
         try:
             self.transfer_state = TransferState.TRANSFERRING_TO_GENERATOR
-            logging.info("=== ATOMIC TRANSFER: Switching to GENERATOR ===")
+            logging.info("=== Transferring to GENERATOR ===")
             
-            # Get the target limit BEFORE making any changes
             target_limit = self.DbusSettings['generatorCurrentLimit']
-            target_type = 2
             
-            # CRITICAL: Change BOTH settings in quick succession
-            logging.info(f"Applying generator input type: {target_type}")
-            self.acInputTypeObj.SetValue(wrap_dbus_value(target_type))
+            self.ac_input_type_obj.SetValue(wrap_dbus_value(2))
             
-            if self.currentLimitIsAdjustableObj and self.currentLimitIsAdjustableObj.GetValue() == 1:
-                logging.info(f"Applying generator current limit: {target_limit}A")
-                self.currentLimitObj.SetValue(wrap_dbus_value(target_limit))
-                # Update last known derated value
+            if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                self.current_limit_obj.SetValue(wrap_dbus_value(target_limit))
                 self.last_derated_active_limit = target_limit
             
-            # Verify both changes took effect
-            success = self.verify_settings_change(target_type, target_limit, "Generator")
-            
-            if success:
-                logging.info("=== ATOMIC TRANSFER: Generator transfer COMPLETE ===")
-            else:
-                logging.error("=== ATOMIC TRANSFER: Generator transfer VERIFICATION FAILED ===")
-            
-            return success
+            logging.info("=== Generator transfer complete ===")
+            GLib.idle_add(self._trigger_derating)
             
         except Exception as e:
-            logging.error(f"Failed to apply generator settings: {e}")
-            return False
+            logging.error(f"Generator transfer failed: {e}")
         finally:
             self.transfer_state = TransferState.IDLE
     
-    def transfer_to_grid(self, lock_holder=None):
-        """Initiate transfer to grid - assumes lock is already held by caller"""
-        if not self.dbusOk or not self.transferSwitchActive:
-            return False
-        
-        # Verify lock is held by the caller
-        if lock_holder is None or not self.transfer_lock.is_held_by(lock_holder):
-            logging.error("transfer_to_grid called without lock being held")
-            return False
-        
+    def _transfer_to_grid(self):
+        """Transfer to grid with delay"""
         try:
             self.transfer_state = TransferState.WAITING_FOR_GENERATOR_SHUTDOWN
-            logging.info(f"=== ATOMIC TRANSFER: Generator shutdown initiated - waiting {self.SHUTDOWN_TIMER_SECONDS}s ===")
-            
-            # Schedule the actual grid transfer after shutdown timer
-            # Pass the lock holder name so it can be released later
-            GLib.timeout_add_seconds(int(self.SHUTDOWN_TIMER_SECONDS), self._execute_grid_transfer, lock_holder)
-            return True
+            logging.info(f"Waiting {self.SHUTDOWN_TIMER_SECONDS}s for generator shutdown")
+            GLib.timeout_add_seconds(int(self.SHUTDOWN_TIMER_SECONDS), self._execute_grid_transfer)
         except Exception as e:
             logging.error(f"Failed to initiate grid transfer: {e}")
             self.transfer_state = TransferState.IDLE
-            return False
     
-    def _execute_grid_transfer(self, lock_holder):
-        """Execute the actual grid transfer after generator shutdown - lock is already held"""
+    def _execute_grid_transfer(self):
+        """Execute grid transfer after delay"""
         try:
             self.transfer_state = TransferState.TRANSFERRING_TO_GRID
-            logging.info("=== ATOMIC TRANSFER: Executing transfer to GRID ===")
+            logging.info("=== Transferring to GRID ===")
             
-            # Handle IgnoreAcIn1 if needed
             try:
-                ignore = self.ignoreAcIn1Obj.GetValue() if self.ignoreAcIn1Obj else 0
+                ignore = self.ignore_ac_in_1_obj.GetValue() if self.ignore_ac_in_1_obj else 0
                 if ignore == 1:
-                    logging.info("Disabling IgnoreAcIn1")
-                    self.ignoreAcIn1Obj.SetValue(wrap_dbus_value(0))
+                    self.ignore_ac_in_1_obj.SetValue(wrap_dbus_value(0))
                     time.sleep(1)
-            except Exception as e:
-                logging.error(f"IgnoreAcIn1 handling failed: {e}")
+            except:
+                pass
             
-            # Get target values BEFORE making changes
             target_type = self.DbusSettings['gridInputType']
             target_limit = self.DbusSettings['gridCurrentLimit']
             
-            # CRITICAL: Change BOTH settings in quick succession
-            logging.info(f"Applying grid input type: {target_type}")
-            self.acInputTypeObj.SetValue(wrap_dbus_value(target_type))
+            self.ac_input_type_obj.SetValue(wrap_dbus_value(target_type))
             
-            if self.currentLimitIsAdjustableObj and self.currentLimitIsAdjustableObj.GetValue() == 1:
-                logging.info(f"Applying grid current limit: {target_limit}A")
-                self.currentLimitObj.SetValue(wrap_dbus_value(target_limit))
-                # Update last known derated value
+            if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                self.current_limit_obj.SetValue(wrap_dbus_value(target_limit))
                 self.last_derated_active_limit = target_limit
             
-            # Verify both changes took effect
-            self.verify_settings_change(target_type, target_limit, "Grid")
-            
-            logging.info("=== ATOMIC TRANSFER: Grid transfer COMPLETE ===")
+            logging.info("=== Grid transfer complete ===")
             
         except Exception as e:
             logging.error(f"Grid transfer failed: {e}")
         finally:
             self.transfer_state = TransferState.IDLE
-            # Release the lock that was acquired by the caller
-            self.transfer_lock.release(lock_holder)
+            self.transfer_lock.release("transfer_switch")
         
         return False
     
-    def update_transfer_switch_state(self):
-        """Update transfer switch state - reads from D-Bus and updates self.onGenerator"""
-        if not self.transferSwitchActive or not self.transferSwitchStateObj:
+    def update_remote_generator_selected(self):
+        """Update RemoteGeneratorSelected"""
+        if self.remote_generator_selected_item is None:
             return
         
-        try:
-            state = self.transferSwitchStateObj.GetValue()
-            if state in (12, 3):
-                self.onGenerator = True
-            elif state in (13, 2):
-                self.onGenerator = False
-            else:
-                logging.debug(f"Unknown transfer switch state: {state}")
-        except Exception as e:
-            logging.debug(f"Error updating transfer switch state: {e}")
+        new_val = 1 if self.onGenerator else 0
+        if new_val != self.remote_generator_selected_local_value:
+            try:
+                self.remote_generator_selected_item.SetValue(wrap_dbus_value(new_val))
+                self.remote_generator_selected_local_value = new_val
+            except Exception as e:
+                logging.error(f"Could not set RemoteGeneratorSelected: {e}")
     
-    def apply_debounced_state(self):
-        if self.pending_generator_state is not None:
-            self.onGenerator = self.pending_generator_state
-            logging.info(f"State confirmed: {'GENERATOR' if self.onGenerator else 'GRID'}")
-            self.pending_generator_state = None
-            self.debounce_timer = None
-        return False
-    
-    def search_for_transfer_switch_input(self):
-        for service in self.bus.list_names():
-            if service.startswith("com.victronenergy.digitalinput"):
-                try:
-                    name_obj = self.bus.get_object(service, '/CustomName')
-                    name = name_obj.GetValue()
-                    if self.extTransferDigInputName.lower() in name.lower():
-                        state_obj = self.bus.get_object(service, '/State')
-                        state = state_obj.GetValue()
-                        if state in (12, 3, 13, 2):
-                            self.transferSwitchNameObj = name_obj
-                            self.transferSwitchStateObj = state_obj
-                            self.transferSwitchActive = True
-                            logging.info(f"Found transfer switch at {service} with name '{name}'")
-                            return
-                except Exception as e:
-                    logging.debug(f"Error checking service {service}: {e}")
-        
-        if not self.firstSearchDone:
-            logging.warning(f"No transfer switch found (name pattern: '{self.extTransferDigInputName}')")
-            self.firstSearchDone = True
-    
-    def validate_settings(self):
+    def _validate_settings(self):
+        """Validate settings"""
         valid = True
         try:
             if self.DbusSettings['gridCurrentLimit'] < 0 or self.DbusSettings['gridCurrentLimit'] > 100:
@@ -1104,148 +1317,6 @@ class DynamicTransferSwitch:
             logging.error(f"Missing setting: {e}")
             valid = False
         return valid
-    
-    def update_remote_generator_selected(self):
-        if self.remoteGeneratorSelectedItem is None:
-            return
-        
-        new_val = 1 if (self.dbusOk and self.onGenerator) else 0
-        if new_val != self.remoteGeneratorSelectedLocalValue:
-            try:
-                self.remoteGeneratorSelectedItem.SetValue(wrap_dbus_value(new_val))
-                self.remoteGeneratorSelectedLocalValue = new_val
-            except:
-                pass
-    
-    def background(self):
-        """Main background loop - runs every second"""
-        if not self.startup_sync_complete:
-            return True
-        
-        # Small delay after startup to let everything settle
-        if not self.startup_settle_done:
-            logging.info("Allowing 2 seconds for system to settle after startup...")
-            time.sleep(2)
-            self.startup_settle_done = True
-        
-        self.update_transfer_switch_state()
-        
-        # Check health of existing services and rediscover if needed
-        self._check_service_health()
-        
-        # Rediscover optional services if not found
-        if not self.outdoor_temp_service_name:
-            self._find_outdoor_temperature_service()
-        if not self.generator_temp_service_name:
-            self._find_generator_temperature_service()
-        if not self.gps_service_name:
-            self._find_gps_service_internal()
-        if not self.gen_auto_current_service:
-            self._find_gen_auto_current_input_internal()
-        
-        # Also check if transfer switch service is still valid
-        if self.transferSwitchActive and self.transferSwitchStateObj:
-            try:
-                # Test if service still responds
-                self.transferSwitchStateObj.GetValue()
-            except:
-                logging.warning("Transfer switch service became unavailable, re-discovering")
-                self.transferSwitchActive = False
-                self.transferSwitchNameObj = None
-                self.transferSwitchStateObj = None
-                self._find_transfer_switch_input_internal()
-        
-        # Check if VE.Bus service is still valid
-        if self.vebus_service and self.dbusOk:
-            try:
-                # Test if service still responds
-                self.acInputTypeObj.GetValue()
-            except:
-                logging.warning("VE.Bus service became unavailable, re-discovering")
-                self.vebus_service = None
-                self.dbusOk = False
-                self._find_vebus_service()
-        
-        # Update sensor values
-        self._update_outdoor_temperature()
-        self._update_altitude()
-        self._update_generator_temperature()
-        self._update_gen_auto_current_state()
-        
-        # Validate settings periodically
-        if time.time() - self.last_validation > 300:
-            self.validate_settings()
-            self.last_validation = time.time()
-        
-        # DYNAMIC SYNC - Active to Saved (only when idle and not transferring)
-        if self.dbusOk and self.transferSwitchActive and self.currentLimitObj and self.transfer_state == TransferState.IDLE and not self.transfer_lock.is_locked:
-            try:
-                current_input_type = self.acInputTypeObj.GetValue()
-                current_limit = self.currentLimitObj.GetValue()
-                
-                if current_input_type == 2:
-                    # On generator - only sync if Gen Auto Current is OFF
-                    if self.gen_auto_current_state != GEN_AUTO_CURRENT_ON:
-                        if abs(current_limit - self.DbusSettings['generatorCurrentLimit']) > 0.1:
-                            logging.info(f"SYNC: Generator limit {self.DbusSettings['generatorCurrentLimit']:.1f}A -> {current_limit:.1f}A")
-                            self.DbusSettings['generatorCurrentLimit'] = current_limit
-                    else:
-                        logging.debug("Gen Auto ON - skipping generator limit sync")
-                elif current_input_type in (1, 3):
-                    # On grid/shore - ALWAYS sync (Gen Auto doesn't affect grid)
-                    if abs(current_limit - self.DbusSettings['gridCurrentLimit']) > 0.1:
-                        logging.info(f"SYNC: Grid limit {self.DbusSettings['gridCurrentLimit']:.1f}A -> {current_limit:.1f}A")
-                        self.DbusSettings['gridCurrentLimit'] = current_limit
-            except Exception as e:
-                logging.error(f"Dynamic sync failed: {e}")
-        
-        # Auto derating - runs every second when Gen Auto Current is ON
-        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.transfer_state == TransferState.IDLE:
-            if self._is_generator_running():
-                # When generator is running, update both active limit and saved generator limit
-                self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=False)
-                self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=False)
-            else:
-                # When generator is not running, only update the saved generator limit
-                self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=False)
-        
-        # Handle transfer switch state changes - acquire lock and then call transfer functions
-        if self.dbusOk and self.transferSwitchActive:
-            if self.lastOnGenerator is None:
-                self.lastOnGenerator = self.onGenerator
-            elif self.onGenerator != self.lastOnGenerator:
-                if self.onGenerator:
-                    # Acquire lock and then transfer to generator
-                    if self.transfer_lock.acquire("state_change", timeout=2):
-                        try:
-                            self.transfer_to_generator("state_change")
-                        finally:
-                            self.transfer_lock.release("state_change")
-                    else:
-                        logging.warning("Could not acquire lock for generator transfer, will retry next cycle")
-                else:
-                    # Acquire lock and then transfer to grid (lock will be released in _execute_grid_transfer)
-                    if self.transfer_lock.acquire("state_change", timeout=2):
-                        try:
-                            self.transfer_to_grid("state_change")
-                        except Exception as e:
-                            logging.error(f"Error during grid transfer: {e}")
-                            self.transfer_lock.release("state_change")
-                    else:
-                        logging.warning("Could not acquire lock for grid transfer, will retry next cycle")
-            self.lastOnGenerator = self.onGenerator
-        elif self.onGenerator:
-            # Fallback - acquire lock and transfer to grid
-            if self.transfer_lock.acquire("fallback", timeout=2):
-                try:
-                    self.transfer_to_grid("fallback")
-                except Exception as e:
-                    logging.error(f"Error during fallback grid transfer: {e}")
-                    self.transfer_lock.release("fallback")
-        
-        self.update_remote_generator_selected()
-        
-        return True
 
 def setup_logging():
     logger = logging.getLogger()
@@ -1259,12 +1330,10 @@ def setup_logging():
     logger.setLevel(logging.INFO)
 
 def main():
-    from dbus.mainloop.glib import DBusGMainLoop
-    DBusGMainLoop(set_as_default=True)
     setup_logging()
     
     logging.info("=" * 60)
-    logging.info("Dynamic Transfer Switch Monitor starting")
+    logging.info("External Transfer Switch Monitor With Auto Gen Current starting")
     logging.info("=" * 60)
     
     DynamicTransferSwitch()
