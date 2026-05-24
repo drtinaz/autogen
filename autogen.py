@@ -74,6 +74,9 @@ GEN_AUTO_CURRENT_ON = 3
 script_dir = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(script_dir, 'config.ini')
 
+# Sensor threshold - changes less than this won't trigger derating
+SENSOR_CHANGE_THRESHOLD = 0.2
+
 class TransferState(Enum):
     """Transfer state machine states"""
     IDLE = "idle"
@@ -145,7 +148,6 @@ class DynamicTransferSwitch:
         # Startup synchronization
         self.startup_sync_complete = False
         self.startup_sequence_run = False
-        self._initial_derating_done = False
         
         # VE.Bus direct objects
         self.vebus_service = None
@@ -157,8 +159,9 @@ class DynamicTransferSwitch:
         self.remote_generator_selected_item = None
         self.remote_generator_selected_local_value = -1
         
-        # Signal match tracking for critical properties
-        self.active_matches = {}
+        # Signal match tracking
+        self.active_matches = {}  # For PropertiesChanged (critical limits)
+        self.items_matches = {}   # For ItemsChanged (sensors and digital inputs)
         
         # Track discovered service names
         self.outdoor_temp_service = None
@@ -175,12 +178,20 @@ class DynamicTransferSwitch:
         self.gps_found = False
         self.gen_auto_current_found = False
         
-        # Sensor values
+        # Lists of services to monitor with ItemsChanged
+        self.items_changed_services = {}  # service_name -> {'type': type, 'callback': callback}
+        
+        # Sensor values with tracking for threshold detection
         self.outdoor_temp_fahrenheit = self.DEFAULT_OUTDOOR_TEMP_F
         self.altitude_feet = self.DEFAULT_ALTITUDE_FEET
         self.generator_temp_fahrenheit = self.DEFAULT_GENERATOR_TEMP_F
         self.gen_auto_current_state = None
         self.previous_gen_auto_current_state = None
+        
+        # Track last values for threshold comparison
+        self.last_outdoor_temp = self.DEFAULT_OUTDOOR_TEMP_F
+        self.last_altitude_feet = self.DEFAULT_ALTITUDE_FEET
+        self.last_generator_temp = self.DEFAULT_GENERATOR_TEMP_F
         
         # Service discovery state
         self.transferSwitchActive = False
@@ -194,7 +205,7 @@ class DynamicTransferSwitch:
         # Setup D-Bus settings
         self._setup_settings()
         
-        # Setup name owner changed monitoring for critical services
+        # Setup NameOwnerChanged monitoring for all services
         self.bus.add_signal_receiver(
             self._on_name_owner_changed,
             bus_name="org.freedesktop.DBus",
@@ -202,51 +213,12 @@ class DynamicTransferSwitch:
             signal_name="NameOwnerChanged"
         )
         
-        # Setup ItemsChanged monitoring for sensors and digital inputs (auto-recoverable)
-        self.items_changed_services = {}
-        
         # Start service discovery
         self._discovery_attempts = 0
         GLib.idle_add(self._discover_services)
         
         # Add periodic status reporting (every 60 seconds) - DEBUG level
         GLib.timeout_add_seconds(60, self._periodic_status)
-    
-    def _register_items_changed_service(self, service_name, callback):
-        """Register a service for ItemsChanged monitoring"""
-        if service_name in self.items_changed_services:
-            return
-        
-        try:
-            match = self.bus.add_signal_receiver(
-                lambda items, **kwargs: self._on_items_changed(items, kwargs, callback),
-                bus_name=service_name,
-                path="/",
-                dbus_interface="com.victronenergy.BusItem",
-                signal_name="ItemsChanged",
-                sender_keyword='sender_name'
-            )
-            self.items_changed_services[service_name] = match
-            logging.info(f"✅ ItemsChanged monitoring for {service_name}")
-            return True
-        except Exception as e:
-            logging.error(f"Failed to setup ItemsChanged for {service_name}: {e}")
-            return False
-    
-    def _on_items_changed(self, items, kwargs, callback):
-        """Handle ItemsChanged signals"""
-        if not self.startup_sync_complete:
-            return
-        
-        if not isinstance(items, dict):
-            return
-        
-        for path, changes in items.items():
-            if 'Value' in changes:
-                try:
-                    callback(path, changes['Value'])
-                except Exception as e:
-                    logging.error(f"Error in ItemsChanged callback: {e}")
     
     def _setup_settings(self):
         """Setup D-Bus settings device"""
@@ -277,7 +249,7 @@ class DynamicTransferSwitch:
         self._subscribe_to_saved_limits()
     
     def _on_settings_device_changed(self, setting, old_value, new_value):
-        """SettingsDevice callback - just for logging, sync handled by PropertiesChanged"""
+        """SettingsDevice callback - just for logging"""
         logging.debug(f"SettingsDevice: {setting} = {new_value} (was {old_value})")
     
     def _load_and_set_config(self):
@@ -330,7 +302,11 @@ class DynamicTransferSwitch:
         except (configparser.Error, ValueError) as e:
             logging.error(f"Error reading config: {e}")
     
+    # =========================================================================
     # Critical Property Monitoring (PropertiesChanged with recovery)
+    # For: Active current limit, Grid limit, Generator limit
+    # =========================================================================
+    
     def _subscribe_to_saved_limits(self):
         """Subscribe to saved current limit changes using PropertiesChanged"""
         # Generator current limit
@@ -397,23 +373,10 @@ class DynamicTransferSwitch:
             logging.error(f"Failed to subscribe to active limit: {e}")
             return False
     
-    def _unsubscribe_from_active_limit(self, service_name):
-        """Unsubscribe from active current limit changes"""
-        key = f"{service_name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}"
-        
-        if key in self.active_matches:
-            try:
-                self.active_matches[key].remove()
-                del self.active_matches[key]
-                logging.info(f"🔴 Unsubscribed from active current limit on {service_name}")
-            except Exception as e:
-                logging.error(f"Failed to unsubscribe: {e}")
-    
     def _read_initial_active_limit(self):
         """Read initial active current limit value"""
         if self.vebus_service:
             try:
-                # Use the standard BusItem interface
                 obj = self.bus.get_object(self.vebus_service, AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH)
                 iface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
                 value = iface.GetValue()
@@ -422,23 +385,104 @@ class DynamicTransferSwitch:
             except Exception as e:
                 logging.error(f"Failed to read initial active limit: {e}")
     
+    # =========================================================================
+    # ItemsChanged Monitoring for Sensors and Digital Inputs (with auto-recovery)
+    # =========================================================================
+    
+    def _register_items_changed_service(self, service_name, service_type, value_callback):
+        """Register a service to monitor with ItemsChanged (auto-recoverable)"""
+        if service_name in self.items_changed_services:
+            return
+        
+        logging.info(f"📝 Registering ItemsChanged for: {service_name} (type: {service_type})")
+        self.items_changed_services[service_name] = {
+            'type': service_type,
+            'callback': value_callback
+        }
+        
+        # If service already has an owner, subscribe immediately
+        if self.bus.name_has_owner(service_name):
+            self._subscribe_items_changed(service_name)
+    
+    def _subscribe_items_changed(self, service_name):
+        """Subscribe to ItemsChanged signals for a specific service"""
+        if service_name in self.items_matches:
+            return
+        
+        try:
+            match = self.bus.add_signal_receiver(
+                lambda items, **kwargs: self._on_items_changed(items, kwargs, service_name),
+                bus_name=service_name,
+                path="/",
+                dbus_interface="com.victronenergy.BusItem",
+                signal_name="ItemsChanged",
+                sender_keyword='sender_name'
+            )
+            self.items_matches[service_name] = match
+            logging.info(f"✅ ItemsChanged subscribed: {service_name}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to subscribe ItemsChanged for {service_name}: {e}")
+            return False
+    
+    def _unsubscribe_items_changed(self, service_name):
+        """Unsubscribe from ItemsChanged signals for a service"""
+        if service_name in self.items_matches:
+            try:
+                self.items_matches[service_name].remove()
+                del self.items_matches[service_name]
+                logging.info(f"🔴 ItemsChanged unsubscribed: {service_name}")
+            except Exception as e:
+                logging.error(f"Failed to unsubscribe: {e}")
+    
+    def _on_items_changed(self, items, kwargs, service_name):
+        """Handle ItemsChanged signals"""
+        if service_name not in self.items_changed_services:
+            return
+        
+        if not self.startup_sync_complete:
+            return
+        
+        service_info = self.items_changed_services[service_name]
+        
+        if not isinstance(items, dict):
+            return
+        
+        for path, changes in items.items():
+            if 'Value' in changes:
+                try:
+                    service_info['callback'](path, changes['Value'])
+                except Exception as e:
+                    logging.error(f"Error in ItemsChanged callback: {e}")
+    
+    # =========================================================================
+    # NameOwnerChanged Handler - Auto-recovery for all services
+    # =========================================================================
+    
     def _on_name_owner_changed(self, name, old_owner, new_owner):
-        """Handle service appearance/disappearance for critical properties"""
-        # Handle VE.Bus service (active current limit)
+        """Handle service appearance/disappearance for all monitored services"""
+        
+        # Handle VE.Bus service (active current limit) - PropertiesChanged
         if name.startswith(VEBUS_SERVICE_BASE):
             if new_owner and not old_owner:
                 logging.info(f"🟢 VE.Bus connected: {name}")
                 self._subscribe_to_active_limit(name)
-                # Also re-setup VE.Bus objects
                 if not self.vebus_service:
                     self.vebus_service = name
                     self._setup_vebus_objects()
             elif old_owner and not new_owner:
                 logging.warning(f"🔴 VE.Bus disconnected: {name}")
-                self._unsubscribe_from_active_limit(name)
-                self.vebus_service = None
+                key = f"{name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}"
+                if key in self.active_matches:
+                    try:
+                        self.active_matches[key].remove()
+                        del self.active_matches[key]
+                    except:
+                        pass
+                if self.vebus_service == name:
+                    self.vebus_service = None
         
-        # Handle Settings service (saved current limits)
+        # Handle Settings service (saved current limits) - PropertiesChanged
         elif name == SETTINGS_SERVICE_NAME:
             if new_owner and not old_owner:
                 logging.info(f"🟢 Settings service connected: {name}")
@@ -452,128 +496,32 @@ class DynamicTransferSwitch:
                             del self.active_matches[key]
                         except:
                             pass
-                logging.info("🔴 Unsubscribed from saved current limits")
+        
+        # Handle all ItemsChanged services (sensors and digital inputs)
+        elif name in self.items_changed_services:
+            if new_owner and not old_owner:
+                logging.info(f"🟢 Service online: {name}")
+                self._subscribe_items_changed(name)
+                GLib.timeout_add_seconds(1, lambda: self._read_initial_items_changed_values(name))
+            elif old_owner and not new_owner:
+                logging.warning(f"🔴 Service offline: {name}")
+                self._unsubscribe_items_changed(name)
     
-    # PropertiesChanged Callbacks
-    def _on_active_limit_changed(self, *args, **kwargs):
-        """Callback for active current limit changes"""
-        if not self.startup_sync_complete:
+    def _read_initial_items_changed_values(self, service_name):
+        """Read initial values after service reconnection"""
+        if service_name not in self.items_changed_services:
             return
         
-        if args and isinstance(args[0], dict):
-            payload = args[0]
-            if 'Value' in payload:
-                new_limit = payload['Value']
-                logging.info(f"🔌 ACTIVE LIMIT CHANGE: {new_limit}A")
-                self._handle_active_limit_change(float(new_limit))
-    
-    def _on_generator_limit_changed(self, *args, **kwargs):
-        """Callback for generator current limit changes"""
-        if not self.startup_sync_complete:
-            return
-        
-        if args and isinstance(args[0], dict):
-            payload = args[0]
-            if 'Value' in payload:
-                new_limit = payload['Value']
-                logging.info(f"⚙️ GENERATOR LIMIT CHANGE: {new_limit}A")
-                self._handle_generator_limit_change(float(new_limit))
-    
-    def _on_grid_limit_changed(self, *args, **kwargs):
-        """Callback for grid current limit changes"""
-        if not self.startup_sync_complete:
-            return
-        
-        if args and isinstance(args[0], dict):
-            payload = args[0]
-            if 'Value' in payload:
-                new_limit = payload['Value']
-                logging.info(f"⚙️ GRID LIMIT CHANGE: {new_limit}A")
-                self._handle_grid_limit_change(float(new_limit))
-    
-    # Limit Change Handlers
-    def _handle_active_limit_change(self, new_limit):
-        """Handle active limit change - sync to saved settings"""
-        if self.transfer_state != TransferState.IDLE:
-            logging.debug(f"Active limit change ignored - transfer in progress")
-            return
-        
-        # Get current input type
         try:
-            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
+            obj = self.bus.get_object(service_name, "/")
+            logging.debug(f"Reconnected to {service_name}, waiting for initial values")
         except Exception as e:
-            logging.error(f"Failed to get input type: {e}")
-            return
-        
-        # If Gen Auto is ON and generator is running, override
-        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self._is_generator_running():
-            logging.info("Gen Auto ON - overriding external change with derated value")
-            GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
-            GLib.idle_add(lambda: self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True))
-            return
-        
-        # Sync active limit to saved setting
-        if current_input_type == 2:  # On generator
-            if self.gen_auto_current_state != GEN_AUTO_CURRENT_ON:
-                current_saved = self.DbusSettings['generatorCurrentLimit']
-                if abs(new_limit - current_saved) > 0.1:
-                    logging.info(f"🔄 SYNC: Updating saved generator limit from {current_saved}A to {new_limit}A")
-                    self.DbusSettings['generatorCurrentLimit'] = new_limit
-                    self.last_derated_gen_setting = new_limit
-        elif current_input_type in (1, 3):  # On grid or shore
-            current_saved = self.DbusSettings['gridCurrentLimit']
-            if abs(new_limit - current_saved) > 0.1:
-                logging.info(f"🔄 SYNC: Updating saved grid limit from {current_saved}A to {new_limit}A")
-                self.DbusSettings['gridCurrentLimit'] = new_limit
+            logging.debug(f"Could not read initial values from {service_name}: {e}")
     
-    def _handle_generator_limit_change(self, new_limit):
-        """Handle saved generator limit change - sync to active if on generator"""
-        if self.transfer_state != TransferState.IDLE:
-            return
-        
-        # Update the settings device
-        self.DbusSettings['generatorCurrentLimit'] = new_limit
-        self.last_derated_gen_setting = new_limit
-        
-        # If Gen Auto is ON, override
-        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
-            logging.info("Gen Auto ON - overriding with derated value")
-            GLib.idle_add(lambda: self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True))
-            if self._is_generator_running():
-                GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
-            return
-        
-        # Apply to active limit if on generator
-        try:
-            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
-            if current_input_type == 2:
-                if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
-                    logging.info(f"🔄 SYNC: Applying generator limit {new_limit}A to active")
-                    self.current_limit_obj.SetValue(wrap_dbus_value(new_limit))
-                    self.last_derated_active_limit = new_limit
-        except Exception as e:
-            logging.error(f"Failed to apply generator limit to active: {e}")
+    # =========================================================================
+    # Service Discovery
+    # =========================================================================
     
-    def _handle_grid_limit_change(self, new_limit):
-        """Handle saved grid limit change - sync to active if on grid/shore"""
-        if self.transfer_state != TransferState.IDLE:
-            return
-        
-        # Update the settings device
-        self.DbusSettings['gridCurrentLimit'] = new_limit
-        
-        # Apply to active limit if on grid or shore
-        try:
-            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
-            if current_input_type in (1, 3):
-                if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
-                    logging.info(f"🔄 SYNC: Applying grid limit {new_limit}A to active")
-                    self.current_limit_obj.SetValue(wrap_dbus_value(new_limit))
-                    self.last_derated_active_limit = new_limit
-        except Exception as e:
-            logging.error(f"Failed to apply grid limit to active: {e}")
-    
-    # Service Discovery Methods
     def _discover_services(self):
         """Discover all required services"""
         self._discovery_attempts += 1
@@ -697,6 +645,7 @@ class DynamicTransferSwitch:
                         
                         self._register_items_changed_service(
                             service,
+                            'transfer_switch',
                             self._on_transfer_switch_value
                         )
                         
@@ -718,10 +667,11 @@ class DynamicTransferSwitch:
                         
                         self._register_items_changed_service(
                             service,
+                            'gen_auto_current',
                             self._on_gen_auto_current_value
                         )
                         
-                        # Get initial state
+                        # Get initial state by reading directly
                         try:
                             state_obj = self.bus.get_object(service, STATE_PATH)
                             state_iface = dbus.Interface(state_obj, BUS_ITEM_INTERFACE)
@@ -753,6 +703,7 @@ class DynamicTransferSwitch:
                         
                         self._register_items_changed_service(
                             service,
+                            'outdoor_temp',
                             self._on_outdoor_temp_value
                         )
                         
@@ -765,6 +716,7 @@ class DynamicTransferSwitch:
                             temp_c = temp_iface.GetValue()
                             if temp_c is not None:
                                 self.outdoor_temp_fahrenheit = (temp_c * 9/5) + 32
+                                self.last_outdoor_temp = self.outdoor_temp_fahrenheit
                                 logging.info(f"   Initial value: {self.outdoor_temp_fahrenheit:.1f}F")
                                 GLib.idle_add(self._trigger_derating)
                         except Exception as e:
@@ -792,6 +744,7 @@ class DynamicTransferSwitch:
                                 
                                 self._register_items_changed_service(
                                     service,
+                                    'generator_temp',
                                     self._on_generator_temp_value
                                 )
                                 
@@ -804,6 +757,7 @@ class DynamicTransferSwitch:
                                     temp_c = temp_iface.GetValue()
                                     if temp_c is not None:
                                         self.generator_temp_fahrenheit = (temp_c * 9/5) + 32
+                                        self.last_generator_temp = self.generator_temp_fahrenheit
                                         logging.info(f"   Initial value: {self.generator_temp_fahrenheit:.1f}F")
                                         GLib.idle_add(self._trigger_derating)
                                 except Exception as e:
@@ -824,6 +778,7 @@ class DynamicTransferSwitch:
                                 
                                 self._register_items_changed_service(
                                     service,
+                                    'generator_temp',
                                     self._on_generator_temp_value
                                 )
                                 
@@ -836,6 +791,7 @@ class DynamicTransferSwitch:
                                     temp_c = temp_iface.GetValue()
                                     if temp_c is not None:
                                         self.generator_temp_fahrenheit = (temp_c * 9/5) + 32
+                                        self.last_generator_temp = self.generator_temp_fahrenheit
                                         logging.info(f"   Initial value: {self.generator_temp_fahrenheit:.1f}F")
                                         GLib.idle_add(self._trigger_derating)
                                 except Exception as e:
@@ -854,6 +810,7 @@ class DynamicTransferSwitch:
             
             self._register_items_changed_service(
                 self.gps_service,
+                'gps',
                 self._on_altitude_value
             )
             
@@ -872,6 +829,7 @@ class DynamicTransferSwitch:
                             alt_m = float(alt)
                         if alt_m is not None:
                             self.altitude_feet = alt_m * 3.28084
+                            self.last_altitude_feet = self.altitude_feet
                             logging.info(f"   Initial altitude: {self.altitude_feet:.0f}ft")
                             GLib.idle_add(self._trigger_derating)
                     except:
@@ -882,7 +840,17 @@ class DynamicTransferSwitch:
             return True
         return False
     
+    # =========================================================================
     # ItemsChanged Callbacks (Sensors and Digital Inputs)
+    # =========================================================================
+    
+    def _should_trigger_derating(self, sensor_name, old_value, new_value, threshold=SENSOR_CHANGE_THRESHOLD):
+        """Check if sensor change is significant enough to trigger derating"""
+        if old_value is None:
+            return True
+        change = abs(new_value - old_value)
+        return change >= threshold
+    
     def _on_transfer_switch_value(self, path, value):
         """Handle transfer switch value changes"""
         if path != STATE_PATH:
@@ -930,10 +898,10 @@ class DynamicTransferSwitch:
         logging.info(f"Gen Auto Current: {'ON' if new_state == GEN_AUTO_CURRENT_ON else 'OFF'}")
         
         if new_state == GEN_AUTO_CURRENT_ON:
-            logging.info("Gen Auto Current enabled - forcing derating")
+            logging.debug("Gen Auto Current enabled - forcing derating")
             GLib.idle_add(self._force_derating)
         else:
-            logging.info("Gen Auto Current disabled - reverting to saved limit")
+            logging.debug("Gen Auto Current disabled - reverting to saved limit")
             GLib.idle_add(self._revert_to_saved_limit)
     
     def _on_outdoor_temp_value(self, path, value):
@@ -943,10 +911,32 @@ class DynamicTransferSwitch:
         
         temp_c = value
         temp_f = (temp_c * 9/5) + 32
-        old_temp = self.outdoor_temp_fahrenheit
-        self.outdoor_temp_fahrenheit = temp_f
-        logging.info(f"🌡️ Outdoor temp: {old_temp:.1f}F -> {temp_f:.1f}F")
-        GLib.idle_add(self._trigger_derating)
+        
+        # Check if change is significant enough to trigger derating
+        if self._should_trigger_derating('outdoor_temp', self.last_outdoor_temp, temp_f):
+            old_temp = self.outdoor_temp_fahrenheit
+            self.outdoor_temp_fahrenheit = temp_f
+            self.last_outdoor_temp = temp_f
+            
+            # Only log at INFO if derating is enabled AND the temperature change affects the derated value
+            if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
+                old_derated = self.calculate_derating_factor(
+                    old_temp, self.altitude_feet, self.generator_temp_fahrenheit
+                )
+                new_derated = self.calculate_derating_factor(
+                    temp_f, self.altitude_feet, self.generator_temp_fahrenheit
+                )
+                if abs(old_derated - new_derated) > 0.1:
+                    logging.debug(f"🌡️ Outdoor temp: {old_temp:.1f}F -> {temp_f:.1f}F (change: {temp_f - old_temp:.1f}F, derated: {old_derated}A -> {new_derated}A)")
+                else:
+                    logging.debug(f"🌡️ Outdoor temp: {old_temp:.1f}F -> {temp_f:.1f}F (no derate change)")
+            else:
+                logging.debug(f"🌡️ Outdoor temp: {old_temp:.1f}F -> {temp_f:.1f}F (derating disabled)")
+            
+            GLib.idle_add(self._trigger_derating)
+        else:
+            # Log as debug for small changes
+            logging.debug(f"🌡️ Outdoor temp: {self.outdoor_temp_fahrenheit:.1f}F -> {temp_f:.1f}F (change: {temp_f - self.outdoor_temp_fahrenheit:.1f}F < {SENSOR_CHANGE_THRESHOLD}F - ignoring)")
     
     def _on_generator_temp_value(self, path, value):
         """Handle generator temperature value changes"""
@@ -955,10 +945,32 @@ class DynamicTransferSwitch:
         
         temp_c = value
         temp_f = (temp_c * 9/5) + 32
-        old_temp = self.generator_temp_fahrenheit
-        self.generator_temp_fahrenheit = temp_f
-        logging.info(f"🔧 Generator temp: {old_temp:.1f}F -> {temp_f:.1f}F")
-        GLib.idle_add(self._trigger_derating)
+        
+        # Check if change is significant enough to trigger derating
+        if self._should_trigger_derating('generator_temp', self.last_generator_temp, temp_f):
+            old_temp = self.generator_temp_fahrenheit
+            self.generator_temp_fahrenheit = temp_f
+            self.last_generator_temp = temp_f
+            
+            # Only log at INFO if derating is enabled AND the temperature change affects the derated value
+            if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
+                old_derated = self.calculate_derating_factor(
+                    self.outdoor_temp_fahrenheit, self.altitude_feet, old_temp
+                )
+                new_derated = self.calculate_derating_factor(
+                    self.outdoor_temp_fahrenheit, self.altitude_feet, temp_f
+                )
+                if abs(old_derated - new_derated) > 0.1:
+                    logging.debug(f"🔧 Generator temp: {old_temp:.1f}F -> {temp_f:.1f}F (change: {temp_f - old_temp:.1f}F, derated: {old_derated}A -> {new_derated}A)")
+                else:
+                    logging.debug(f"🔧 Generator temp: {old_temp:.1f}F -> {temp_f:.1f}F (no derate change)")
+            else:
+                logging.debug(f"🔧 Generator temp: {old_temp:.1f}F -> {temp_f:.1f}F (derating disabled)")
+            
+            GLib.idle_add(self._trigger_derating)
+        else:
+            # Log as debug for small changes
+            logging.debug(f"🔧 Generator temp: {self.generator_temp_fahrenheit:.1f}F -> {temp_f:.1f}F (change: {temp_f - self.generator_temp_fahrenheit:.1f}F < {SENSOR_CHANGE_THRESHOLD}F - ignoring)")
     
     def _on_altitude_value(self, path, value):
         """Handle altitude value changes"""
@@ -971,15 +983,165 @@ class DynamicTransferSwitch:
             else:
                 alt_m = float(value)
             if alt_m is not None:
-                old_alt = self.altitude_feet
-                self.altitude_feet = alt_m * 3.28084
-                if abs(old_alt - self.altitude_feet) > 10:
-                    logging.info(f"🗻 Altitude: {old_alt:.0f}ft -> {self.altitude_feet:.0f}ft")
-                GLib.idle_add(self._trigger_derating)
+                new_altitude_ft = alt_m * 3.28084
+                
+                # Check if change is significant enough to trigger derating (10ft threshold for altitude)
+                if self._should_trigger_derating('altitude', self.last_altitude_feet, new_altitude_ft, threshold=10.0):
+                    old_alt = self.altitude_feet
+                    self.altitude_feet = new_altitude_ft
+                    self.last_altitude_feet = new_altitude_ft
+                    
+                    # Only log at INFO if derating is enabled and change is significant
+                    if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
+                        old_derated = self.calculate_derating_factor(
+                            self.outdoor_temp_fahrenheit, old_alt, self.generator_temp_fahrenheit
+                        )
+                        new_derated = self.calculate_derating_factor(
+                            self.outdoor_temp_fahrenheit, new_altitude_ft, self.generator_temp_fahrenheit
+                        )
+                        if abs(old_derated - new_derated) > 0.1:
+                            logging.debug(f"🗻 Altitude: {old_alt:.0f}ft -> {self.altitude_feet:.0f}ft (change: {self.altitude_feet - old_alt:.0f}ft, derated: {old_derated}A -> {new_derated}A)")
+                        else:
+                            logging.debug(f"🗻 Altitude: {old_alt:.0f}ft -> {self.altitude_feet:.0f}ft (no derate change)")
+                    else:
+                        logging.debug(f"🗻 Altitude: {old_alt:.0f}ft -> {self.altitude_feet:.0f}ft (derating disabled)")
+                    
+                    GLib.idle_add(self._trigger_derating)
+                else:
+                    # Log as debug for small changes
+                    logging.debug(f"🗻 Altitude: {self.altitude_feet:.0f}ft -> {new_altitude_ft:.0f}ft (change: {new_altitude_ft - self.altitude_feet:.0f}ft < 10ft - ignoring)")
         except Exception as e:
             logging.debug(f"Error processing altitude: {e}")
     
+    # =========================================================================
+    # PropertiesChanged Callbacks (Critical Limits)
+    # =========================================================================
+    
+    def _on_active_limit_changed(self, *args, **kwargs):
+        """Callback for active current limit changes"""
+        if not self.startup_sync_complete:
+            return
+        
+        if args and isinstance(args[0], dict):
+            payload = args[0]
+            if 'Value' in payload:
+                new_limit = payload['Value']
+                logging.debug(f"🔌 ACTIVE LIMIT CHANGE: {new_limit}A")
+                self._handle_active_limit_change(float(new_limit))
+    
+    def _on_generator_limit_changed(self, *args, **kwargs):
+        """Callback for generator current limit changes"""
+        if not self.startup_sync_complete:
+            return
+        
+        if args and isinstance(args[0], dict):
+            payload = args[0]
+            if 'Value' in payload:
+                new_limit = payload['Value']
+                logging.debug(f"⚙️ GENERATOR LIMIT CHANGE: {new_limit}A")
+                self._handle_generator_limit_change(float(new_limit))
+    
+    def _on_grid_limit_changed(self, *args, **kwargs):
+        """Callback for grid current limit changes"""
+        if not self.startup_sync_complete:
+            return
+        
+        if args and isinstance(args[0], dict):
+            payload = args[0]
+            if 'Value' in payload:
+                new_limit = payload['Value']
+                logging.debug(f"⚙️ GRID LIMIT CHANGE: {new_limit}A")
+                self._handle_grid_limit_change(float(new_limit))
+    
+    # =========================================================================
+    # Limit Change Handlers (2-way sync)
+    # =========================================================================
+    
+    def _handle_active_limit_change(self, new_limit):
+        """Handle active limit change - sync to saved settings"""
+        if self.transfer_state != TransferState.IDLE:
+            logging.debug(f"Active limit change ignored - transfer in progress")
+            return
+        
+        # Get current input type
+        try:
+            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
+        except Exception as e:
+            logging.error(f"Failed to get input type: {e}")
+            return
+        
+        # If Gen Auto is ON and generator is running, override
+        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self._is_generator_running():
+            logging.debug("Gen Auto ON - overriding external change with derated value")
+            GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
+            GLib.idle_add(lambda: self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True))
+            return
+        
+        # Sync active limit to saved setting
+        if current_input_type == 2:  # On generator
+            if self.gen_auto_current_state != GEN_AUTO_CURRENT_ON:
+                current_saved = self.DbusSettings['generatorCurrentLimit']
+                if abs(new_limit - current_saved) > 0.1:
+                    logging.debug(f"🔄 SYNC: Updating saved generator limit from {current_saved}A to {new_limit}A")
+                    self.DbusSettings['generatorCurrentLimit'] = new_limit
+                    self.last_derated_gen_setting = new_limit
+        elif current_input_type in (1, 3):  # On grid or shore
+            current_saved = self.DbusSettings['gridCurrentLimit']
+            if abs(new_limit - current_saved) > 0.1:
+                logging.debug(f"🔄 SYNC: Updating saved grid limit from {current_saved}A to {new_limit}A")
+                self.DbusSettings['gridCurrentLimit'] = new_limit
+    
+    def _handle_generator_limit_change(self, new_limit):
+        """Handle saved generator limit change - sync to active if on generator"""
+        if self.transfer_state != TransferState.IDLE:
+            return
+        
+        # Update the settings device
+        self.DbusSettings['generatorCurrentLimit'] = new_limit
+        self.last_derated_gen_setting = new_limit
+        
+        # If Gen Auto is ON, override
+        if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
+            logging.debug("Gen Auto ON - overriding with derated value")
+            GLib.idle_add(lambda: self._perform_derating(GENERATOR_CURRENT_LIMIT_PATH, force=True))
+            if self._is_generator_running():
+                GLib.idle_add(lambda: self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True))
+            return
+        
+        # Apply to active limit if on generator
+        try:
+            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
+            if current_input_type == 2:
+                if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                    logging.debug(f"🔄 SYNC: Applying generator limit {new_limit}A to active")
+                    self.current_limit_obj.SetValue(wrap_dbus_value(new_limit))
+                    self.last_derated_active_limit = new_limit
+        except Exception as e:
+            logging.error(f"Failed to apply generator limit to active: {e}")
+    
+    def _handle_grid_limit_change(self, new_limit):
+        """Handle saved grid limit change - sync to active if on grid/shore"""
+        if self.transfer_state != TransferState.IDLE:
+            return
+        
+        # Update the settings device
+        self.DbusSettings['gridCurrentLimit'] = new_limit
+        
+        # Apply to active limit if on grid or shore
+        try:
+            current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
+            if current_input_type in (1, 3):
+                if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
+                    logging.debug(f"🔄 SYNC: Applying grid limit {new_limit}A to active")
+                    self.current_limit_obj.SetValue(wrap_dbus_value(new_limit))
+                    self.last_derated_active_limit = new_limit
+        except Exception as e:
+            logging.error(f"Failed to apply grid limit to active: {e}")
+    
+    # =========================================================================
     # Startup and Core Functions
+    # =========================================================================
+    
     def _perform_startup_sync(self):
         """Perform initial synchronization after discovery"""
         logging.info("=" * 60)
@@ -1095,7 +1257,7 @@ class DynamicTransferSwitch:
             GLib.timeout_add_seconds(1, self._force_derating)
             return
         
-        logging.info("Forcing derating update")
+        logging.debug("Forcing derating update")
         
         if self._is_generator_running():
             self._perform_derating(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, force=True)
@@ -1136,8 +1298,8 @@ class DynamicTransferSwitch:
                 generator_temp_multiplier = self.MEDIUM_GENTEMP_REDUCTION
         
         derated = self.BASE_GENERATOR_OUTPUT_AMPS
-        derated = derated * temperature_multiplier
         derated = derated * altitude_multiplier
+        derated = derated * temperature_multiplier
         derated = derated * generator_temp_multiplier
         derated = derated * self.OUTPUT_BUFFER
         
@@ -1171,7 +1333,7 @@ class DynamicTransferSwitch:
             
             if current is None or abs(float(current) - derated) > 0.05 or force:
                 self._set_dbus_value(service, target_path, derated)
-                logging.info(f"💡 {desc} updated to {derated}A")
+                logging.debug(f"💡 {desc} updated to {derated}A")
                 
                 if target_path == GENERATOR_CURRENT_LIMIT_PATH:
                     self.last_derated_gen_setting = derated
@@ -1263,6 +1425,7 @@ class DynamicTransferSwitch:
             try:
                 ignore = self.ignore_ac_in_1_obj.GetValue() if self.ignore_ac_in_1_obj else 0
                 if ignore == 1:
+                    logging.info("Disabling IgnoreAcIn1")
                     self.ignore_ac_in_1_obj.SetValue(wrap_dbus_value(0))
                     time.sleep(1)
             except:
