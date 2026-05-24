@@ -6,3 +6,5 @@ v0.3
   add locking mechanism to transfer process
 v0.5
   changede service name and changed from polling to signal monitoring
+v0.6
+  reduce log spamming
