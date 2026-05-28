@@ -75,9 +75,6 @@ GEN_AUTO_CURRENT_ON = 3
 script_dir = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE_PATH = os.path.join(script_dir, 'config.ini')
 
-# Sensor threshold - changes less than this won't trigger derating
-SENSOR_CHANGE_THRESHOLD = 0.2
-
 class TransferState(Enum):
     """Transfer state machine states"""
     IDLE = "idle"
@@ -461,7 +458,8 @@ class DynamicTransferSwitch:
         self.DEFAULT_OUTDOOR_TEMP_F = 77.0
         self.SHUTDOWN_TIMER_SECONDS = 10
         self.extTransferDigInputName = "transfer switch"
-        self.ALTITUDE_THRESHOLD_FEET = 10.0  # Configurable altitude threshold
+        self.ALTITUDE_THRESHOLD_FEET = 50.0  # Configurable altitude threshold to trigger a derate calculation
+        self.SENSOR_CHANGE_THRESHOLD = 0.5  # threshold for temperature sensors to trigger a derate calculation
         
         # Service patterns (can be overridden in config)
         self.generator_temp_patterns = ["gen", "generator", "gen temp", "generator temp"]
@@ -494,6 +492,8 @@ class DynamicTransferSwitch:
             if config.has_section('SensorThresholds'):
                 self.ALTITUDE_THRESHOLD_FEET = config.getfloat('SensorThresholds', 'altitude_threshold_feet', fallback=self.ALTITUDE_THRESHOLD_FEET)
                 logging.info(f"Altitude threshold: {self.ALTITUDE_THRESHOLD_FEET}ft")
+                self.SENSOR_CHANGE_THRESHOLD = config.getfloat('SensorThresholds', 'sensor_change_threshold', fallback=self.SENSOR_CHANGE_THRESHOLD)
+                logging.info(f"Temperature threshold: {self.SENSOR_CHANGE_THRESHOLD}")
             
             # Load service patterns from config
             if config.has_section('ServicePatterns'):
@@ -850,10 +850,10 @@ class DynamicTransferSwitch:
                         if last_value is not None:
                             diff = new_temp_f - last_value
                             logging.info(f"  Change from last known: {diff:+.1f}F")
-                            if abs(diff) >= SENSOR_CHANGE_THRESHOLD:
+                            if abs(diff) >= self.SENSOR_CHANGE_THRESHOLD:
                                 logging.info(f"  → Significant change, triggering derating")
                             else:
-                                logging.info(f"  → No significant change (threshold: {SENSOR_CHANGE_THRESHOLD}F)")
+                                logging.info(f"  → No significant change (threshold: {self.SENSOR_CHANGE_THRESHOLD}F)")
                         self.outdoor_temp_fahrenheit = new_temp_f
                         self.last_outdoor_temp_raw = new_temp_f
                         GLib.idle_add(self._trigger_derating)
@@ -871,10 +871,10 @@ class DynamicTransferSwitch:
                         if last_value is not None:
                             diff = new_temp_f - last_value
                             logging.info(f"  Change from last known: {diff:+.1f}F")
-                            if abs(diff) >= SENSOR_CHANGE_THRESHOLD:
+                            if abs(diff) >= self.SENSOR_CHANGE_THRESHOLD:
                                 logging.info(f"  → Significant change, triggering derating")
                             else:
-                                logging.info(f"  → No significant change (threshold: {SENSOR_CHANGE_THRESHOLD}F)")
+                                logging.info(f"  → No significant change (threshold: {self.SENSOR_CHANGE_THRESHOLD}F)")
                         self.generator_temp_fahrenheit = new_temp_f
                         self.last_generator_temp_raw = new_temp_f
                         GLib.idle_add(self._trigger_derating)
@@ -1405,7 +1405,10 @@ class DynamicTransferSwitch:
             return True
         return False
     
-    def _should_trigger_derating(self, sensor_name, old_raw_value, new_raw_value, threshold=SENSOR_CHANGE_THRESHOLD):
+    def _should_trigger_derating(self, sensor_name, old_raw_value, new_raw_value, threshold=None):
+
+        if threshold is None:
+            threshold = getattr(self, 'SENSOR_CHANGE_THRESHOLD', 0.5)
         """Determine if sensor change should trigger derating recalculation"""
         if old_raw_value is None:
             return True
@@ -1523,7 +1526,7 @@ class DynamicTransferSwitch:
         else:
             # Update value but log that it didn't trigger derating
             self.outdoor_temp_fahrenheit = temp_f
-            logging.debug(f"Outdoor temp change below threshold ({abs(temp_f - old_raw):.3f}F < {SENSOR_CHANGE_THRESHOLD}F) - no derating triggered")
+            logging.debug(f"Outdoor temp change below threshold ({abs(temp_f - old_raw):.3f}F < {self.SENSOR_CHANGE_THRESHOLD}F) - no derating triggered")
     
     def _on_generator_temp_value(self, path, value):
         """Handle generator temperature value changes"""
@@ -1575,7 +1578,7 @@ class DynamicTransferSwitch:
         else:
             # Update value but log that it didn't trigger derating
             self.generator_temp_fahrenheit = temp_f
-            logging.debug(f"Generator temp change below threshold ({abs(temp_f - old_raw):.3f}F < {SENSOR_CHANGE_THRESHOLD}F) - no derating triggered")
+            logging.debug(f"Generator temp change below threshold ({abs(temp_f - old_raw):.3f}F < {self.SENSOR_CHANGE_THRESHOLD}F) - no derating triggered")
     
     def _on_altitude_value(self, path, value):
         """Handle altitude value changes"""
