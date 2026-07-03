@@ -1718,7 +1718,7 @@ class DynamicTransferSwitch:
             if current_input_type in (1, 3):  # On grid/shore
                 current_saved = self.DbusSettings['gridCurrentLimit']
                 if abs(new_limit - current_saved) > 0.1:
-                    logging.info(f"Generator not running, on grid - Syncing active limit {new_limit}A -> stored grid limit")
+                    logging.debug(f"Generator not running, on grid - Syncing active limit {new_limit}A -> stored grid limit")
                     self._updating_grid_limit = True
                     try:
                         self.DbusSettings['gridCurrentLimit'] = new_limit
@@ -1839,7 +1839,7 @@ class DynamicTransferSwitch:
                 current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
                 if current_input_type in (1, 3):  # On grid/shore
                     if self.current_limit_is_adjustable_obj and self.current_limit_is_adjustable_obj.GetValue() == 1:
-                        logging.info(f"Generator not running - Syncing grid limit {new_limit}A -> active limit")
+                        logging.debug(f"Generator not running - Syncing grid limit {new_limit}A -> active limit")
                         self._updating_active_limit = True
                         try:
                             self.current_limit_obj.SetValue(wrap_dbus_value(new_limit))
