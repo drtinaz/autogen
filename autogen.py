@@ -1536,7 +1536,7 @@ class DynamicTransferSwitch:
         # Check if change from last derate exceeds threshold
         if self._should_trigger_derating('outdoor_temp', temp_f):
             change = abs(temp_f - self._last_derate_outdoor_temp)
-            logging.info(f"Outdoor temp changed from last derate by {change:.2f}F (threshold: {self.SENSOR_CHANGE_THRESHOLD}F) - triggering derating")
+            logging.debug(f"Outdoor temp changed from last derate by {change:.2f}F (threshold: {self.SENSOR_CHANGE_THRESHOLD}F) - triggering derating")
             if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
                 GLib.idle_add(self._trigger_derating)
             elif self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
@@ -1578,7 +1578,7 @@ class DynamicTransferSwitch:
         # Check if change from last derate exceeds threshold
         if self._should_trigger_derating('generator_temp', temp_f):
             change = abs(temp_f - self._last_derate_gen_temp)
-            logging.info(f"Generator temp changed from last derate by {change:.1f}F (threshold: {self.SENSOR_CHANGE_THRESHOLD}F) - triggering derating")
+            logging.debug(f"Generator temp changed from last derate by {change:.1f}F (threshold: {self.SENSOR_CHANGE_THRESHOLD}F) - triggering derating")
             if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
                 GLib.idle_add(self._trigger_derating)
             elif self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
@@ -1615,7 +1615,7 @@ class DynamicTransferSwitch:
             # Check if change from last derate exceeds threshold
             if self._should_trigger_derating('altitude', new_altitude_ft):
                 change = abs(new_altitude_ft - self._last_derate_altitude)
-                logging.info(f"Altitude changed from last derate by {change:.1f}ft (threshold: {self.ALTITUDE_THRESHOLD_FEET}ft) - triggering derating")
+                logging.debug(f"Altitude changed from last derate by {change:.1f}ft (threshold: {self.ALTITUDE_THRESHOLD_FEET}ft) - triggering derating")
                 if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON and self.startup_sync_complete:
                     GLib.idle_add(self._trigger_derating)
                 elif self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
@@ -1731,7 +1731,7 @@ class DynamicTransferSwitch:
         # Generator IS running - current input MUST be generator (input_type == 2)
         # Scenario 4: Generator running, Gen Auto OFF, active limit changed (on generator)
         if current_input_type == 2 and self.gen_auto_current_state != GEN_AUTO_CURRENT_ON:
-            logging.info(f"Gen Auto OFF, on generator - Syncing active limit {new_limit}A -> saved generator limit")
+            logging.debug(f"Gen Auto OFF, on generator - Syncing active limit {new_limit}A -> saved generator limit")
             current_saved = self.DbusSettings['generatorCurrentLimit']
             if abs(new_limit - current_saved) > 0.1:
                 self._updating_generator_limit = True
@@ -1816,7 +1816,7 @@ class DynamicTransferSwitch:
             return
         
         # Scenario 5: Gen Auto OFF, generator running - sync stored → active
-        logging.info(f"Gen Auto OFF, Gen running - Syncing saved generator limit {new_limit}A -> active limit")
+        logging.debug(f"Gen Auto OFF, Gen running - Syncing saved generator limit {new_limit}A -> active limit")
         self._sync_saved_to_active(new_limit)
     
     def _handle_grid_limit_change(self, new_limit):
@@ -1922,7 +1922,7 @@ class DynamicTransferSwitch:
     
     def _force_derating(self, retry_count=0):
         """Force derating update with transfer state handling and retry limit"""
-        logging.info(f"_force_derating called: retry_count={retry_count}, startup={self.startup_sync_complete}, "
+        logging.debug(f"_force_derating called: retry_count={retry_count}, startup={self.startup_sync_complete}, "
                      f"transfer={self.transfer_state}, gen_auto={self.gen_auto_current_state}, "
                      f"gen_running={self._is_generator_running()}")
         
@@ -1950,7 +1950,7 @@ class DynamicTransferSwitch:
             self._update_saved_derated_value()
             return
         
-        logging.info("Forcing derating update - calling _perform_derating(force=True)")
+        logging.debug("Forcing derating update - calling _perform_derating(force=True)")
         self._perform_derating(force=True)
     
     def _update_saved_derated_value(self):
@@ -2003,7 +2003,7 @@ class DynamicTransferSwitch:
     
     def _perform_derating(self, force=False):
         """Calculate and apply derated value with comprehensive race condition protection"""
-        logging.info(f"_perform_derating called: force={force}, startup={self.startup_sync_complete}, "
+        logging.debug(f"_perform_derating called: force={force}, startup={self.startup_sync_complete}, "
                      f"transfer={self.transfer_state}, gen_auto={self.gen_auto_current_state}, "
                      f"gen_running={self._is_generator_running()}")
         
@@ -2060,8 +2060,8 @@ class DynamicTransferSwitch:
         self._last_derate_gen_temp = self.generator_temp_fahrenheit
         self._last_derate_altitude = self.altitude_feet
         
-        logging.info(f"Applying derated value: {derated}A (force={force})")
-        logging.info(f"Last derate sensor values stored: outdoor={self._last_derate_outdoor_temp:.2f}F, gen={self._last_derate_gen_temp:.1f}F, alt={self._last_derate_altitude:.0f}ft")
+        logging.debug(f"Applying derated value: {derated}A (force={force})")
+        logging.debug(f"Last derate sensor values stored: outdoor={self._last_derate_outdoor_temp:.2f}F, gen={self._last_derate_gen_temp:.1f}F, alt={self._last_derate_altitude:.0f}ft")
         
         # Update version tracking
         self._derate_version += 1
@@ -2075,7 +2075,7 @@ class DynamicTransferSwitch:
             logging.debug(f"Writing derated value to saved generator limit: {derated}A")
             self.DbusSettings['generatorCurrentLimit'] = derated
             self.last_derated_gen_setting = derated
-            logging.info(f"Derated saved generator limit to {derated}A (version: {self._derate_version})")
+            logging.debug(f"Derated saved generator limit to {derated}A (version: {self._derate_version})")
             
             # FORCE write to active limit
             if self.vebus_service:
