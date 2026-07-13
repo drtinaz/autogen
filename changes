@@ -14,3 +14,5 @@ v1.1
   enhancements to logging and temperature signal updates verification
 v1.2
   add sensor threshold to config
+v1.3
+  bugfix
