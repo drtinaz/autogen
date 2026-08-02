@@ -16,3 +16,5 @@ v1.2
   add sensor threshold to config
 v1.3
   bugfix
+v1.4
+  Refactor active limit subscription logic
