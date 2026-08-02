@@ -575,31 +575,74 @@ class DynamicTransferSwitch:
                 logging.error(f"Failed to subscribe to grid limit: {e}")
     
     def _subscribe_to_active_limit(self, service_name):
-        """Subscribe to active current limit changes using PropertiesChanged"""
-        key = f"{service_name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}"
+        """Subscribe to active current limit changes using both PropertiesChanged (per-item)
+        and ItemsChanged (service-wide batch on the root path). Every other Venus service this
+        script talks to (temp sensors, GPS, digital inputs) is subscribed via ItemsChanged because
+        that's the mechanism most Venus device drivers actually use to report externally or
+        firmware-driven value updates - vebus was the one exception, relying on PropertiesChanged
+        alone, which can silently miss a current-limit change made through the GX UI/VRM remote
+        console if the vebus driver only ever emits the batch signal for that kind of update."""
+        prop_key = f"{service_name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}"
+        items_key = f"{service_name}__items"
         
-        if key in self.active_matches:
+        if prop_key not in self.active_matches:
+            try:
+                logging.info(f"Attempting to subscribe to active limit (PropertiesChanged) on {service_name}")
+                match = self.bus.add_signal_receiver(
+                    lambda *args, **kwargs: self._on_active_limit_changed(*args, **kwargs),
+                    bus_name=service_name,
+                    path=AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH,
+                    dbus_interface="com.victronenergy.BusItem",
+                    signal_name="PropertiesChanged",
+                    path_keyword='path',
+                    sender_keyword='sender_name'
+                )
+                self.active_matches[prop_key] = match
+                logging.info(f"Successfully subscribed (PropertiesChanged) to active current limit on {service_name}")
+            except Exception as e:
+                logging.error(f"Failed to subscribe to active limit (PropertiesChanged): {e}")
+        
+        if items_key not in self.active_matches:
+            try:
+                logging.info(f"Attempting to subscribe to active limit (ItemsChanged) on {service_name}")
+                match = self.bus.add_signal_receiver(
+                    lambda items, **kwargs: self._on_vebus_items_changed(items, service_name),
+                    bus_name=service_name,
+                    path="/",
+                    dbus_interface="com.victronenergy.BusItem",
+                    signal_name="ItemsChanged",
+                    sender_keyword='sender_name'
+                )
+                self.active_matches[items_key] = match
+                logging.info(f"Successfully subscribed (ItemsChanged) to {service_name}")
+            except Exception as e:
+                logging.error(f"Failed to subscribe to active limit (ItemsChanged): {e}")
+        
+        self.vebus_service = service_name
+        self._read_initial_active_limit()
+        return True
+    
+    def _on_vebus_items_changed(self, items, service_name):
+        """Handle the ItemsChanged batch signal from the vebus service - some Venus/firmware
+        versions report an externally or firmware-driven current-limit change only through this
+        batch mechanism rather than a per-item PropertiesChanged signal, so this is the primary
+        way we should expect to catch a manual edit made via the GX UI or VRM remote console."""
+        if not self.startup_sync_complete:
             return
         
-        try:
-            logging.info(f"Attempting to subscribe to active limit on {service_name}")
-            match = self.bus.add_signal_receiver(
-                lambda *args, **kwargs: self._on_active_limit_changed(*args, **kwargs),
-                bus_name=service_name,
-                path=AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH,
-                dbus_interface="com.victronenergy.BusItem",
-                signal_name="PropertiesChanged",
-                path_keyword='path',
-                sender_keyword='sender_name'
-            )
-            self.active_matches[key] = match
-            self.vebus_service = service_name
-            logging.info(f"Successfully subscribed to active current limit on {service_name}")
-            self._read_initial_active_limit()
-            return True
-        except Exception as e:
-            logging.error(f"Failed to subscribe to active limit: {e}")
-            return False
+        if hasattr(self, '_updating_active_limit') and self._updating_active_limit:
+            logging.debug("vebus ItemsChanged - active limit update in progress from our own write, skipping")
+            return
+        
+        if not isinstance(items, dict):
+            return
+        
+        changes = items.get(AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH)
+        if changes and isinstance(changes, dict) and 'Value' in changes:
+            new_limit = changes['Value']
+            if new_limit is not None:
+                logging.debug(f"vebus ItemsChanged: active limit changed to {new_limit}A")
+                self._handle_active_limit_change(float(new_limit))
     
     def _read_initial_active_limit(self):
         """Read initial active current limit value"""
@@ -750,13 +793,13 @@ class DynamicTransferSwitch:
                 logging.warning(f"VE.Bus disconnected: {name}")
                 if self.last_derated_active_limit is not None:
                     logging.info(f"  Last known active limit: {self.last_derated_active_limit}A")
-                key = f"{name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}"
-                if key in self.active_matches:
-                    try:
-                        self.active_matches[key].remove()
-                        del self.active_matches[key]
-                    except Exception as e:
-                        logging.debug(f"Error removing VE.Bus match: {e}")
+                for key in (f"{name}{AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH}", f"{name}__items"):
+                    if key in self.active_matches:
+                        try:
+                            self.active_matches[key].remove()
+                            del self.active_matches[key]
+                        except Exception as e:
+                            logging.debug(f"Error removing VE.Bus match: {e}")
                 if self.vebus_service == name:
                     self.vebus_service = None
         
@@ -1705,14 +1748,16 @@ class DynamicTransferSwitch:
             current_input_type = self.ac_input_type_obj.GetValue() if self.ac_input_type_obj else None
         except Exception as e:
             logging.error(f"Failed to get input type: {e}")
-            return
+            current_input_type = None
+        
+        generator_running = self._is_generator_running()
         
         # CRITICAL DEBUG: Log all state information
         logging.debug(f"ACTIVE LIMIT HANDLER: new_limit={new_limit}, input_type={current_input_type}, "
-                     f"gen_running={self._is_generator_running()}, gen_auto={self.gen_auto_current_state}")
+                     f"gen_running={generator_running}, gen_auto={self.gen_auto_current_state}")
         
         # If generator is NOT running
-        if not self._is_generator_running():
+        if not generator_running:
             logging.debug("Generator not running - handling active limit change")
             # Scenario 1: Active limit changed while on grid (generator not running) - sync to stored grid
             if current_input_type in (1, 3):  # On grid/shore
@@ -1728,9 +1773,14 @@ class DynamicTransferSwitch:
                 logging.debug(f"Generator not running, input_type={current_input_type} - ignoring active limit change")
             return
         
-        # Generator IS running - current input MUST be generator (input_type == 2)
+        # Generator IS running. Correction below is keyed off generator-running state alone
+        # (not a live current_input_type read) - a stale/None/mis-timed input_type read must
+        # never be allowed to suppress an override correction while the generator is running.
+        if current_input_type is not None and current_input_type not in (1, 2, 3):
+            logging.warning(f"Generator running with unexpected input_type={current_input_type} - proceeding based on generator state")
+        
         # Scenario 4: Generator running, Gen Auto OFF, active limit changed (on generator)
-        if current_input_type == 2 and self.gen_auto_current_state != GEN_AUTO_CURRENT_ON:
+        if self.gen_auto_current_state != GEN_AUTO_CURRENT_ON:
             logging.debug(f"Gen Auto OFF, on generator - Syncing active limit {new_limit}A -> saved generator limit")
             current_saved = self.DbusSettings['generatorCurrentLimit']
             if abs(new_limit - current_saved) > 0.1:
@@ -1743,35 +1793,17 @@ class DynamicTransferSwitch:
             return
         
         # Scenario 6: Generator running, Gen Auto ON, active limit changed (on generator)
-        if current_input_type == 2 and self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
-            logging.debug(f"Gen Auto ON, on generator - External active limit change detected: {new_limit}A")
-            
-            # If derating already pending, don't schedule another
-            if hasattr(self, '_derating_pending') and self._derating_pending:
-                logging.debug("Derating already pending - not scheduling another")
-                return
-            
-            # Reject external change - force derate (updates both saved and active)
-            logging.debug(f"Gen Auto ON, on generator - EXTERNAL active limit change ({new_limit}A) detected - FORCING DERATE")
-            self._force_derating()
+        logging.debug(f"Gen Auto ON, on generator - External active limit change detected: {new_limit}A")
+        
+        # If derating already pending, retry shortly once it clears rather than dropping the correction
+        if hasattr(self, '_derating_pending') and self._derating_pending:
+            logging.debug("Derating already pending - scheduling force-derate after it clears")
+            GLib.timeout_add(150, self._force_derating)
             return
         
-        # Scenario 9: Generator running, but somehow on grid - this shouldn't happen
-        # If it does, treat it as a grid sync
-        if current_input_type in (1, 3):
-            logging.warning(f"Generator running but on grid (input_type={current_input_type}) - unexpected state")
-            current_saved = self.DbusSettings['gridCurrentLimit']
-            if abs(new_limit - current_saved) > 0.1:
-                logging.info(f"On grid - Syncing active limit {new_limit}A -> saved grid limit")
-                self._updating_grid_limit = True
-                try:
-                    self.DbusSettings['gridCurrentLimit'] = new_limit
-                finally:
-                    self._updating_grid_limit = False
-            return
-        
-        # Should never reach here
-        logging.warning(f"Unhandled active limit change: input_type={current_input_type}, gen_running={self._is_generator_running()}, gen_auto={self.gen_auto_current_state}")
+        # Reject external change - force derate (updates both saved and active)
+        logging.debug(f"Gen Auto ON, on generator - EXTERNAL active limit change ({new_limit}A) detected - FORCING DERATE")
+        self._force_derating()
     
     def _handle_generator_limit_change(self, new_limit):
         """Handle saved generator limit changes with proper sync/reject logic"""
@@ -1792,9 +1824,10 @@ class DynamicTransferSwitch:
         if self.gen_auto_current_state == GEN_AUTO_CURRENT_ON:
             logging.debug(f"Gen Auto ON - Generator limit change detected: {new_limit}A")
             
-            # If derating already pending, skip
+            # If derating already pending, retry shortly once it clears rather than dropping the correction
             if hasattr(self, '_derating_pending') and self._derating_pending:
-                logging.debug("Derating already pending - not scheduling another")
+                logging.debug("Derating already pending - scheduling force-derate after it clears")
+                GLib.timeout_add(150, self._force_derating)
                 return
             
             # Scenario 3: Generator NOT running, Gen Auto ON - reject, restore derated
@@ -1876,6 +1909,67 @@ class DynamicTransferSwitch:
                 logging.debug(f"Not on generator (input_type={current_input_type}) - no active sync needed")
         except Exception as e:
             logging.error(f"Failed to sync generator limit to active: {e}")
+    
+    def _push_active_limit_with_verification(self, derated, retries_left=5, _flag_owned=False):
+        """Push the derated value to the active AC input current limit, verifying it actually
+        lands on the vebus service and retrying if VE.Bus rejected or ignored the write - e.g.
+        CurrentLimitIsAdjustable was momentarily 0, or the write raced a manual edit landing
+        on the same D-Bus object a moment earlier. Owns the _updating_active_limit recursion
+        guard for the entire retry sequence, so a delayed retry write is never misread as a
+        fresh external change and doesn't loop back into another forced derate."""
+        if not self.vebus_service:
+            logging.debug("No vebus service available - cannot push active limit")
+            if _flag_owned:
+                self._updating_active_limit = False
+            return
+        
+        if retries_left <= 0:
+            logging.error(f"Active limit push FAILED after all retries - could not confirm {derated}A was applied")
+            self._updating_active_limit = False
+            return
+        
+        # Take/hold ownership of the recursion guard for the whole retry sequence
+        self._updating_active_limit = True
+        
+        try:
+            is_adjustable = self.current_limit_is_adjustable_obj.GetValue() if self.current_limit_is_adjustable_obj else None
+        except Exception as e:
+            logging.debug(f"Could not read CurrentLimitIsAdjustable: {e}")
+            is_adjustable = None
+        
+        logging.debug(f"Active limit push attempt (retries_left={retries_left}): target={derated}A, CurrentLimitIsAdjustable={is_adjustable}")
+        
+        if is_adjustable == 0:
+            logging.warning(f"CurrentLimitIsAdjustable=0 - write would likely be ignored right now, retrying in 400ms ({retries_left - 1} retries left after this)")
+            GLib.timeout_add(400, lambda: self._push_active_limit_with_verification(derated, retries_left - 1, _flag_owned=True))
+            return
+        
+        applied = self._set_dbus_value(self.vebus_service, AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, derated)
+        
+        if not applied:
+            logging.warning(f"_set_dbus_value reported failure writing active limit - retrying in 400ms ({retries_left - 1} retries left after this)")
+            GLib.timeout_add(400, lambda: self._push_active_limit_with_verification(derated, retries_left - 1, _flag_owned=True))
+            return
+        
+        logging.debug("SetValue call for active limit returned success - verifying with read-back in 300ms")
+        GLib.timeout_add(300, lambda: self._verify_active_limit_applied(derated, retries_left))
+    
+    def _verify_active_limit_applied(self, derated, retries_left):
+        """Read back the active limit to confirm the write actually took effect on the hardware,
+        rather than trusting that SetValue not raising means it was applied."""
+        try:
+            actual = self.current_limit_obj.GetValue() if self.current_limit_obj else None
+        except Exception as e:
+            logging.debug(f"Could not read back active limit for verification: {e}")
+            actual = None
+        
+        if actual is not None and abs(float(actual) - derated) <= 0.1:
+            self.last_derated_active_limit = derated
+            logging.info(f"Active limit confirmed applied: {actual}A (target {derated}A)")
+            self._updating_active_limit = False
+        else:
+            logging.warning(f"Active limit verification MISMATCH - read back {actual}A, expected {derated}A - retrying ({retries_left - 1} left)")
+            GLib.timeout_add(400, lambda: self._push_active_limit_with_verification(derated, retries_left - 1, _flag_owned=True))
     
     def _is_generator_running(self):
         """Check if generator is currently running"""
@@ -1995,10 +2089,12 @@ class DynamicTransferSwitch:
         finally:
             self._updating_generator_limit = False
     
-    def _clear_derating_flags(self):
-        """Clear derating flags after callbacks have processed"""
+    def _clear_generator_limit_flag(self):
+        """Clear the generator-limit recursion guard after our own write has propagated.
+        (_updating_active_limit is no longer cleared here - it's owned end-to-end by
+        _push_active_limit_with_verification, since that write can involve retries that
+        take longer than this fixed 100ms window.)"""
         self._updating_generator_limit = False
-        self._updating_active_limit = False
         return False
     
     def _perform_derating(self, force=False):
@@ -2019,13 +2115,17 @@ class DynamicTransferSwitch:
             logging.debug("Gen Auto Current is OFF - skipping derating")
             return
         
-        # Debounce check
-        current_time = time.time()
-        if hasattr(self, '_last_derate_time'):
-            if current_time - self._last_derate_time < 0.5:
-                logging.debug(f"Skipping derate - too soon since last derate ({current_time - self._last_derate_time:.3f}s ago)")
-                return
-        self._last_derate_time = current_time
+        # Debounce check (forced derates bypass debounce - they exist specifically
+        # to correct an external override and must not be silently dropped)
+        if not force:
+            current_time = time.time()
+            if hasattr(self, '_last_derate_time'):
+                if current_time - self._last_derate_time < 0.5:
+                    logging.debug(f"Skipping derate - too soon since last derate ({current_time - self._last_derate_time:.3f}s ago)")
+                    return
+            self._last_derate_time = current_time
+        else:
+            self._last_derate_time = time.time()
         
         try:
             derated = self.calculate_derating_factor(
@@ -2067,7 +2167,6 @@ class DynamicTransferSwitch:
         self._derate_version += 1
         self._last_processed_version = self._derate_version
         self._updating_generator_limit = True
-        self._updating_active_limit = True
         success = False
         
         try:
@@ -2077,22 +2176,20 @@ class DynamicTransferSwitch:
             self.last_derated_gen_setting = derated
             logging.debug(f"Derated saved generator limit to {derated}A (version: {self._derate_version})")
             
-            # FORCE write to active limit
+            # Push to active limit with verification + retry - do NOT assume a SetValue
+            # call that didn't raise actually landed on the vebus service.
             if self.vebus_service:
-                logging.debug(f"Writing derated value to active limit: {derated}A")
-                self._set_dbus_value(self.vebus_service, AC_ACTIVE_INPUT_CURRENT_LIMIT_PATH, derated)
-                self.last_derated_active_limit = derated
-                logging.debug(f"Updated active limit to derated value: {derated}A")
+                logging.debug(f"Pushing derated value to active limit (verified, with retry): {derated}A")
+                self._push_active_limit_with_verification(derated, retries_left=5)
             success = True
         except Exception as e:
             logging.error(f"Derating failed: {e}")
             self._derate_version = self._last_processed_version - 1
         finally:
             if success:
-                GLib.timeout_add(100, self._clear_derating_flags)
+                GLib.timeout_add(100, self._clear_generator_limit_flag)
             else:
                 self._updating_generator_limit = False
-                self._updating_active_limit = False
     
     def calculate_derating_factor(self, temp_f, alt_ft, gen_temp_f):
         """Calculate derated output"""
@@ -2266,18 +2363,23 @@ class DynamicTransferSwitch:
             return None, False
     
     def _set_dbus_value(self, service_name, path, value):
-        """Set D-Bus value with proper error handling"""
+        """Set D-Bus value with proper error handling. Returns True on success, False otherwise -
+        callers that need the write to actually land (e.g. active current limit corrections)
+        must check this rather than assuming success."""
         if not service_name:
-            return
+            return False
         
         try:
             obj = self.bus.get_object(service_name, path)
             interface = dbus.Interface(obj, BUS_ITEM_INTERFACE)
             interface.SetValue(wrap_dbus_value(value))
+            return True
         except dbus.DBusException as e:
             logging.error(f"D-Bus error setting {path}: {e}")
+            return False
         except Exception as e:
             logging.error(f"Unexpected error setting {path}: {e}")
+            return False
     
     def update_remote_generator_selected(self):
         """Update RemoteGeneratorSelected"""
