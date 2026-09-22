@@ -18,6 +18,7 @@ import sys
 import subprocess
 import os
 import time
+import math
 import dbus
 import configparser
 import threading
@@ -2191,6 +2192,19 @@ class DynamicTransferSwitch:
             else:
                 self._updating_generator_limit = False
     
+    def _quantize_to_hw_resolution(self, value):
+        """The vebus AC input current limit only accepts even-tenths steps
+        (0.2A resolution) and silently floors any other value down to the
+        nearest one - confirmed via dbus-spy (e.g. 22.3 -> 22.2, 37.7 -> 37.6).
+        Quantizing here, once, at the source of the derated value ensures the
+        saved setting, the active-limit push, and the read-back verification
+        are all comparing against a value the hardware can actually hold
+        exactly - avoiding endless verification-mismatch retries and the
+        unnecessary dbus writes/logging churn that come with them."""
+        hw_resolution = 0.2
+        steps = math.floor(value / hw_resolution + 1e-6)
+        return round(steps * hw_resolution, 1)
+
     def calculate_derating_factor(self, temp_f, alt_ft, gen_temp_f):
         """Calculate derated output"""
         temperature_multiplier = 1.0
@@ -2220,7 +2234,7 @@ class DynamicTransferSwitch:
         derated = derated * generator_temp_multiplier
         derated = derated * self.OUTPUT_BUFFER
         
-        return round(derated, 1)
+        return self._quantize_to_hw_resolution(derated)
     
     def _transfer_to_generator(self):
         """Transfer to generator"""
